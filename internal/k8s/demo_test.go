@@ -3,6 +3,8 @@ package k8s
 import (
 	"testing"
 	"time"
+
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 )
 
 func TestDemoStoreListsEveryBuiltin(t *testing.T) {
@@ -25,5 +27,26 @@ func TestDemoStoreListsEveryBuiltin(t *testing.T) {
 		if !statuses[want] {
 			t.Errorf("missing pod status %s, got %v", want, statuses)
 		}
+	}
+}
+
+func TestDemoUpdateVersions(t *testing.T) {
+	s := NewStore(NewDemoProvider(), time.Second)
+	key := Key{Context: "demo-dev", GVR: MustLookup("deployments").GVR()}
+	obj, err := s.GetObject(key, "shop", "cart")
+	if err != nil {
+		t.Fatal(err)
+	}
+	stale := obj.DeepCopy()
+	obj.SetLabels(map[string]string{"edited": "yes"})
+	upd, err := s.Update(key, obj)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if upd.GetResourceVersion() == stale.GetResourceVersion() {
+		t.Fatal("update should bump the resourceVersion")
+	}
+	if _, err := s.Update(key, stale); !apierrors.IsConflict(err) {
+		t.Fatalf("stale update: got %v, want a conflict", err)
 	}
 }

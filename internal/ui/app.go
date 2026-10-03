@@ -13,6 +13,9 @@ import (
 	"github.com/charmbracelet/x/ansi"
 	"github.com/hdweiss/coralctl/internal/config"
 	"github.com/hdweiss/coralctl/internal/k8s"
+	"github.com/hdweiss/coralctl/internal/schema"
+	"github.com/hdweiss/coralctl/internal/theme"
+	"github.com/hdweiss/coralctl/internal/yamltree"
 	"k8s.io/apimachinery/pkg/util/duration"
 )
 
@@ -22,7 +25,9 @@ type Options struct {
 	AllNamespaces bool
 	Refresh       time.Duration // background refresh of the visible list; 0 disables
 	Version       string
-	PinsPath      string // where pins are saved; "" keeps them in memory only
+	PinsPath      string        // where pins are saved; "" keeps them in memory only
+	FieldsPath    string        // where favorite and hidden fields are saved; "" keeps them in memory only
+	Theme         *theme.Source // colors, reloaded when they change; nil keeps the built-in palette
 }
 
 type focusID int
@@ -77,10 +82,16 @@ type App struct {
 	drag          int // 0 none, 1 nav|table divider, 2 table|detail divider
 	zoom          bool
 
-	palette     *palette
-	filtering   bool
-	filterInput textinput.Model
-	help        bool
+	palette       *palette
+	picker        *picker
+	pickTarget    addTarget
+	editing       *editState
+	schemas       map[string]schema.Source
+	schemaLoading map[string]bool // detail schema lookups in flight
+	builtin       *schema.Builtin
+	filtering     bool
+	filterInput   textinput.Model
+	help          bool
 
 	flash    string
 	flashErr bool
@@ -113,25 +124,32 @@ func New(store *k8s.Store, opts Options) (*App, error) {
 		ns = ""
 	}
 
+	if opts.Theme != nil {
+		t, err := opts.Theme.Load()
+		if err != nil {
+			return nil, fmt.Errorf("loading theme: %w", err)
+		}
+		applyTheme(t)
+	}
+
 	fi := textinput.New()
 	fi.Prompt = "/"
-	st := textinput.DefaultDarkStyles()
-	st.Focused.Prompt = stBarKey
-	st.Focused.Text = stBar
-	fi.SetStyles(st)
 
 	a := &App{
-		store:       store,
-		opts:        opts,
-		nav:         newNavView(store),
-		table:       &tableView{},
-		detail:      &detailView{},
-		focus:       focusTable,
-		ctx:         ctx,
-		ns:          ns,
-		loading:     map[k8s.Key]bool{},
-		navW:        30,
-		filterInput: fi,
+		store:         store,
+		opts:          opts,
+		nav:           newNavView(store),
+		table:         &tableView{},
+		detail:        &detailView{},
+		focus:         focusTable,
+		ctx:           ctx,
+		ns:            ns,
+		loading:       map[k8s.Key]bool{},
+		navW:          30,
+		filterInput:   fi,
+		schemas:       map[string]schema.Source{},
+		schemaLoading: map[string]bool{},
+		builtin:       schema.NewBuiltin(),
 	}
 	contexts := p.Contexts()
 	a.pins = &pinsView{known: func(c string) bool { return slices.Contains(contexts, c) }}
@@ -141,6 +159,11 @@ func New(store *k8s.Store, opts Options) (*App, error) {
 		a.pins.pins = pins
 	}
 	a.nav.pinned = a.pins.has
+	fields, err := config.LoadFields(opts.FieldsPath)
+	if err != nil {
+		a.setFlash("loading fields: "+err.Error(), true)
+	}
+	a.detail.fields = fields
 	a.nav.root(ctx).expanded = true
 	a.nav.refresh()
 	a.setFocus(focusTable)
@@ -308,12 +331,34 @@ func (a *App) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		cmd = a.fetch(k8s.Key{Context: msg.context, GVR: nsGVR})
 	case openDetailMsg:
 		a.setFocus(focusDetail)
+	case editReadyMsg:
+		cmd = a.onEditReady(msg)
+	case editorExitMsg:
+		cmd = a.onEditorExit(msg)
+	case updatedMsg:
+		cmd = a.onUpdated(msg)
+	case schemaMsg:
+		cmd = a.onSchema(msg)
+	case needSchemaMsg:
+		cmd = a.ensureDetailSchema()
+	case detailSchemaMsg:
+		delete(a.schemaLoading, msg.key)
+		if msg.key == a.detailSchemaKey() {
+			a.detail.info.schemaKey, a.detail.info.schema, a.detail.info.err = msg.key, msg.schema, msg.err
+		}
+	case fieldsChangedMsg:
+		if err := config.SaveFields(a.opts.FieldsPath, a.detail.fields); err != nil {
+			a.setFlash("saving fields: "+err.Error(), true)
+		}
 	case togglePinMsg:
 		a.togglePin(msg.pin)
 	case openPinMsg:
 		cmd = a.openPin(msg.pin)
 	case tickMsg:
 		cmds := []tea.Cmd{tick()}
+		if t, ok := a.opts.Theme.Changed(); ok {
+			applyTheme(t)
+		}
 		if e, ok := a.store.Get(a.cur); ok && a.opts.Refresh > 0 && time.Since(e.FetchedAt) >= a.opts.Refresh {
 			cmds = append(cmds, a.fetch(a.cur))
 		}
@@ -324,19 +369,59 @@ func (a *App) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		cmd = a.handleMouse(msg)
 	default:
 		// Cursor blink and similar internal messages of the text inputs.
-		if a.palette != nil {
+		if a.picker != nil {
+			cmd, _, _ = a.picker.Update(msg)
+		} else if a.palette != nil {
 			cmd, _, _ = a.palette.Update(msg)
 		} else if a.filtering {
 			a.filterInput, cmd = a.filterInput.Update(msg)
 		}
 	}
+	// The info popup follows the selection, which may now be another kind.
+	if a.detail.info.on {
+		cmd = tea.Batch(cmd, a.ensureDetailSchema())
+	}
 	return a, cmd
+}
+
+// detailSchemaKey identifies the schema the detail view needs.
+func (a *App) detailSchemaKey() string {
+	if a.detail.obj == nil {
+		return ""
+	}
+	return a.cur.Context + "|" + a.detail.obj.GroupVersionKind().String()
+}
+
+// ensureDetailSchema loads the schema for the info popup if it is missing.
+func (a *App) ensureDetailSchema() tea.Cmd {
+	key := a.detailSchemaKey()
+	if key == "" || key == a.detail.info.schemaKey || a.schemaLoading[key] {
+		return nil
+	}
+	a.detail.info.schemaKey, a.detail.info.schema, a.detail.info.err = "", nil, nil
+	a.schemaLoading[key] = true
+	src, gvk := a.schemaSource(a.cur.Context), a.detail.obj.GroupVersionKind()
+	return func() tea.Msg {
+		s, err := src.Lookup(gvk)
+		return detailSchemaMsg{key: key, schema: s, err: err}
+	}
 }
 
 func (a *App) handleKey(msg tea.KeyPressMsg) tea.Cmd {
 	key := msg.String()
 	if key == "ctrl+c" {
 		return tea.Quit
+	}
+
+	if a.picker != nil {
+		cmd, done, res := a.picker.Update(msg)
+		if done {
+			a.picker = nil
+			if res != nil {
+				return a.onPicked(res)
+			}
+		}
+		return cmd
 	}
 
 	if a.palette != nil {
@@ -393,6 +478,21 @@ func (a *App) handleKey(msg tea.KeyPressMsg) tea.Cmd {
 	case "1", "2", "3":
 		a.setFocus(focusID(key[0] - '1'))
 		return nil
+	case "e":
+		switch a.focus {
+		case focusTable:
+			return a.startEdit(nil)
+		case focusDetail:
+			var focus []yamltree.Seg
+			if n := a.detail.current(); n != nil {
+				focus = n.Segments()
+			}
+			return a.startEdit(focus)
+		}
+	case "a":
+		if a.focus == focusTable || a.focus == focusDetail {
+			return a.startAdd()
+		}
 	case "r":
 		a.setFlash("refreshing…", false)
 		return tea.Batch(a.fetch(a.cur), a.fetch(k8s.Key{Context: a.ctx, GVR: nsGVR}))
@@ -402,6 +502,8 @@ func (a *App) handleKey(msg tea.KeyPressMsg) tea.Cmd {
 		return nil
 	case "esc":
 		switch {
+		case a.focus == focusDetail && a.detail.info.on:
+			a.detail.info.on = false
 		case a.zoom:
 			a.zoom = false
 			a.layout()
@@ -471,6 +573,16 @@ func (a *App) handleMouse(msg tea.MouseMsg) tea.Cmd {
 			a.lastClick.t = time.Time{} // a third click starts over
 		}
 
+		if a.picker != nil {
+			done, res := a.picker.Click(m.X, m.Y)
+			if done {
+				a.picker = nil
+				if res != nil {
+					return a.onPicked(res)
+				}
+			}
+			return nil
+		}
 		if a.palette != nil {
 			done, run := a.palette.Click(m.X, m.Y)
 			if done {
@@ -530,6 +642,10 @@ func (a *App) handleMouse(msg tea.MouseMsg) tea.Cmd {
 			delta = -3
 		case tea.MouseWheelDown:
 			delta = 3
+		}
+		if a.picker != nil {
+			a.picker.Wheel(delta / 3)
+			return nil
 		}
 		if a.palette != nil {
 			a.palette.Wheel(delta / 3)
@@ -754,7 +870,13 @@ func (a *App) View() tea.View {
 	}
 	content := a.renderHeader() + "\n" + lipgloss.JoinHorizontal(lipgloss.Top, parts...) + "\n" + a.renderStatus()
 
+	if a.detail.info.on && a.focus == focusDetail && a.detail.rect.w > 0 && a.detail.obj != nil {
+		content = a.overlayInfo(content)
+	}
 	switch {
+	case a.picker != nil:
+		box := a.picker.View(a.w, a.h)
+		content = overlay(content, box, a.picker.rect.x, a.picker.rect.y)
 	case a.palette != nil:
 		box := a.palette.View(a.w)
 		content = overlay(content, box, a.palette.rect.x, a.palette.rect.y)
@@ -764,6 +886,43 @@ func (a *App) View() tea.View {
 	}
 	v.SetContent(content)
 	return v
+}
+
+// overlayInfo draws the info popup like a tooltip: below the selected line
+// of the details, or above it when there is no room below.
+func (a *App) overlayInfo(content string) string {
+	r := a.detail.rect
+	w := max(min(r.w-4, 72), min(40, a.w-2))
+	x := min(r.x+2, a.w-w)
+	row := r.y + 1 + a.detail.cursor - a.detail.offset
+	below := r.y + r.h - 1 - (row + 1)
+	above := row - r.y - 1
+	box, links := a.detail.infoView(w, max(below, above, 5))
+	if box == "" {
+		return content
+	}
+	h := lipgloss.Height(box)
+	y := row + 1
+	if h > below && above > below {
+		y = row - h
+	}
+	y = max(y, 1)
+	for _, l := range links {
+		url := l.url
+		a.buttons = append(a.buttons, button{x0: x + 1, x1: x + w - 1, y: y + l.row, run: func() tea.Cmd {
+			if err := openURL(url); err != nil {
+				a.setFlash("opening link: "+err.Error(), true)
+			} else {
+				a.setFlash("opened "+url, false)
+			}
+			return nil
+		}})
+	}
+	// Other clicks on the popup should not reach the panel underneath.
+	for i := range h {
+		a.buttons = append(a.buttons, button{x0: x, x1: x + w, y: y + i, run: func() tea.Cmd { return nil }})
+	}
+	return overlay(content, box, x, y)
 }
 
 func overlay(base, top string, x, y int) string {
@@ -829,6 +988,10 @@ func (a *App) renderStatus() string {
 	y := a.h - 1
 	if a.filtering {
 		a.filterInput.SetWidth(a.w - 4)
+		// Styled here rather than once so that it follows theme changes.
+		st := inputStyles(stBarKey)
+		st.Focused.Text = stBar
+		a.filterInput.SetStyles(st)
 		return stBar.Render(fit(a.filterInput.View(), a.w))
 	}
 
@@ -849,8 +1012,19 @@ func (a *App) renderStatus() string {
 	case focusPins:
 		hints = append(hints, hint{"p", "unpin", func() tea.Cmd { return a.pins.Update(tea.KeyPressMsg{Code: 'p', Text: "p"}) }})
 	case focusTable:
+		hints = append(hints,
+			hint{"e", "edit", func() tea.Cmd { return a.startEdit(nil) }},
+			hint{"a", "add", a.startAdd})
 		hints = append(hints, hint{"s", "sort", func() tea.Cmd { return a.table.Update(tea.KeyPressMsg{Code: 's', Text: "s"}) }})
 	case focusDetail:
+		key := func(k rune) func() tea.Cmd {
+			return func() tea.Cmd { return a.detail.Update(tea.KeyPressMsg{Code: k, Text: string(k)}) }
+		}
+		hints = append(hints,
+			hint{"e", "edit", func() tea.Cmd { return a.handleKey(tea.KeyPressMsg{Code: 'e', Text: "e"}) }},
+			hint{"a", "add", a.startAdd},
+			hint{"i", "info", key('i')},
+			hint{"f", "favorite", key('f')}, hint{"x", "hide", key('x')})
 		hints = append(hints,
 			hint{"O", "expand all", func() tea.Cmd { return a.detail.Update(tea.KeyPressMsg{Code: 'O', Text: "O"}) }},
 			hint{"C", "collapse all", func() tea.Cmd { return a.detail.Update(tea.KeyPressMsg{Code: 'C', Text: "C"}) }})
@@ -905,6 +1079,10 @@ func helpView() string {
 			{"enter space", "open / toggle"},
 			{"s S", "table: next sort column / reverse"},
 			{"O C", "details: expand all / collapse all"},
+			{"f x", "details: favorite (to the top) / hide (to the bottom)"},
+			{"e", "edit the object in $EDITOR (at the selected field)"},
+			{"a", "add a field below the selected one, from the API schema"},
+			{"i", "details: toggle help for the selected field"},
 		}},
 		{"Mouse", [][2]string{
 			{"click", "select, focus a panel, toggle ▸ ▾"},

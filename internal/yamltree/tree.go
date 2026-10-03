@@ -16,8 +16,9 @@ const (
 	Scalar Kind = iota
 	Map
 	List
-	Text // multi-line string; children are its lines
-	Line // one line of a Text node
+	Text   // multi-line string; children are its lines
+	Line   // one line of a Text node
+	Hidden // "N hidden" group at the end of a section; children are the hidden fields
 )
 
 type Node struct {
@@ -30,6 +31,13 @@ type Node struct {
 	Depth    int
 	Expanded bool
 	Path     string // e.g. .spec.containers[0].image
+
+	// Set by Arrange.
+	Favorite bool // shown at the top of its section
+	IsHidden bool // moved into its section's Hidden group
+
+	natural []*Node // children in display order before Arrange
+	hidden  *Node   // this section's Hidden group, kept so its folding survives
 }
 
 // Build creates the tree for obj. The returned root is not itself displayed.
@@ -98,6 +106,9 @@ var keyOrder = map[string][]string{
 	".metadata": {"name", "generateName", "namespace", "uid", "resourceVersion", "generation", "creationTimestamp", "deletionTimestamp", "labels", "annotations", "ownerReferences", "finalizers", "managedFields"},
 }
 
+// OrderedKeys returns the keys of the map at path in display order.
+func OrderedKeys(path string, obj map[string]any) []string { return orderedKeys(path, obj) }
+
 func orderedKeys(path string, obj map[string]any) []string {
 	keys := make([]string, 0, len(obj))
 	for k := range obj {
@@ -124,6 +135,95 @@ func orderedKeys(path string, obj map[string]any) []string {
 	return keys
 }
 
+var indexRe = regexp.MustCompile(`\[\d+\]`)
+
+// Pattern is Path with list indices generalized, so that a rule for
+// .spec.containers[].image covers every container.
+func (n *Node) Pattern() string { return indexRe.ReplaceAllString(n.Path, "[]") }
+
+// Arrangeable reports whether a node can be a favorite or hidden: a map field,
+// not a list item, a line or a Hidden group.
+func (n *Node) Arrangeable() bool {
+	return n.Parent != nil && n.Index < 0 && n.Kind != Line && n.Kind != Hidden
+}
+
+// Arrange reorders the fields below n: favorites move to the top of their
+// section, hidden ones into a Hidden group at its end. It can be called again
+// whenever the rules change.
+func (n *Node) Arrange(favorite, hidden func(*Node) bool) {
+	if n.Kind != Map && n.Kind != List {
+		return
+	}
+	if n.natural == nil {
+		n.natural = n.Children
+	}
+	var favs, rest, hid []*Node
+	for _, c := range n.natural {
+		c.Favorite, c.IsHidden = false, false
+		if c.Arrangeable() {
+			c.IsHidden = hidden(c)
+			c.Favorite = !c.IsHidden && favorite(c)
+		}
+		switch {
+		case c.IsHidden:
+			hid = append(hid, c)
+		case c.Favorite:
+			favs = append(favs, c)
+		default:
+			rest = append(rest, c)
+		}
+		c.Arrange(favorite, hidden)
+	}
+	n.Children = append(favs, rest...)
+	if len(hid) > 0 {
+		if n.hidden == nil {
+			n.hidden = &Node{Kind: Hidden, Index: -1, Parent: n, Depth: n.Depth + 1, Path: n.Path + "#hidden"}
+		}
+		n.hidden.Children = hid
+		n.Children = append(n.Children, n.hidden)
+	}
+}
+
+// Fields is the number of fields or items in a map or list, hidden ones
+// included.
+func (n *Node) Fields() int {
+	if n.natural != nil {
+		return len(n.natural)
+	}
+	return len(n.Children)
+}
+
+// HiddenDepth counts n and its ancestors that are hidden; hidden fields are
+// drawn that much further in, below their group.
+func (n *Node) HiddenDepth() int {
+	d := 0
+	for ; n != nil; n = n.Parent {
+		if n.IsHidden {
+			d++
+		}
+	}
+	return d
+}
+
+// Seg is one step of a path: a map key, or a list index when Index >= 0.
+type Seg struct {
+	Key   string
+	Index int
+}
+
+// Segments returns the path from the root to n.
+func (n *Node) Segments() []Seg {
+	var segs []Seg
+	for ; n != nil && n.Parent != nil; n = n.Parent {
+		if n.Kind == Line || n.Kind == Hidden {
+			continue
+		}
+		segs = append(segs, Seg{Key: n.Key, Index: n.Index})
+	}
+	slices.Reverse(segs)
+	return segs
+}
+
 // HasChildren reports whether the node can be folded.
 func (n *Node) HasChildren() bool { return len(n.Children) > 0 }
 
@@ -144,7 +244,12 @@ func (n *Node) Visible() []*Node {
 }
 
 // SetExpanded sets the expanded state of n and all of its descendants.
+// Hidden groups keep their state: expanding everything should not bring back
+// what the user hid.
 func (n *Node) SetExpanded(expanded bool) {
+	if n.Kind == Hidden {
+		return
+	}
 	if n.Parent != nil { // keep root open
 		n.Expanded = expanded
 	}

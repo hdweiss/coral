@@ -1,10 +1,13 @@
 package k8s
 
 import (
+	"errors"
 	"fmt"
 	"hash/fnv"
+	"strconv"
 	"time"
 
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime"
@@ -12,6 +15,8 @@ import (
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/dynamic"
 	dynamicfake "k8s.io/client-go/dynamic/fake"
+	"k8s.io/client-go/openapi"
+	k8stesting "k8s.io/client-go/testing"
 )
 
 // demoProvider serves in-memory fake clusters, for development without a
@@ -28,7 +33,9 @@ func NewDemoProvider() Provider {
 	p := &demoProvider{clients: map[string]dynamic.Interface{}}
 	for _, name := range p.Contexts() {
 		objs := buildDemoCluster(name)
-		p.clients[name] = dynamicfake.NewSimpleDynamicClientWithCustomListKinds(runtime.NewScheme(), listKinds, objs...)
+		c := dynamicfake.NewSimpleDynamicClientWithCustomListKinds(runtime.NewScheme(), listKinds, objs...)
+		c.PrependReactor("update", "*", versionUpdates(c.Tracker()))
+		p.clients[name] = c
 	}
 	return p
 }
@@ -36,11 +43,42 @@ func NewDemoProvider() Provider {
 func (p *demoProvider) Contexts() []string             { return []string{"demo-dev", "demo-prod"} }
 func (p *demoProvider) Current() string                { return "demo-dev" }
 func (p *demoProvider) DefaultNamespace(string) string { return "shop" }
+func (p *demoProvider) OpenAPI(string) (openapi.Client, error) {
+	return nil, errors.New("the demo clusters have no OpenAPI document")
+}
 func (p *demoProvider) Client(ctx string) (dynamic.Interface, error) {
 	if c, ok := p.clients[ctx]; ok {
 		return c, nil
 	}
 	return nil, fmt.Errorf("unknown context %q", ctx)
+}
+
+// versionUpdates makes updates behave like a real API server: a stale
+// resourceVersion is a conflict, and every update bumps the version. The fake
+// tracker does neither on its own.
+func versionUpdates(tracker k8stesting.ObjectTracker) k8stesting.ReactionFunc {
+	return func(action k8stesting.Action) (bool, runtime.Object, error) {
+		upd, ok := action.(k8stesting.UpdateAction)
+		if !ok {
+			return false, nil, nil
+		}
+		u, ok := upd.GetObject().(*unstructured.Unstructured)
+		if !ok {
+			return false, nil, nil
+		}
+		cur, err := tracker.Get(action.GetResource(), action.GetNamespace(), u.GetName())
+		if err != nil {
+			return false, nil, nil // let the tracker report it
+		}
+		curRV := cur.(metav1.Object).GetResourceVersion()
+		if u.GetResourceVersion() != "" && u.GetResourceVersion() != curRV {
+			return true, nil, apierrors.NewConflict(action.GetResource().GroupResource(), u.GetName(),
+				errors.New("the object has been modified; please apply your changes to the latest version and try again"))
+		}
+		n, _ := strconv.Atoi(curRV)
+		u.SetResourceVersion(strconv.Itoa(n + 1))
+		return false, nil, nil
+	}
 }
 
 // --- demo object builders. Values must be JSON types (int64, not int). ---

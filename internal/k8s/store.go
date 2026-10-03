@@ -84,3 +84,37 @@ func (s *Store) list(k Key) ([]unstructured.Unstructured, error) {
 	}
 	return list.Items, nil
 }
+
+func (s *Store) resource(k Key, namespace string) (dynamic.ResourceInterface, error) {
+	client, err := s.provider.Client(k.Context)
+	if err != nil {
+		return nil, err
+	}
+	if namespace != "" {
+		return client.Resource(k.GVR).Namespace(namespace), nil
+	}
+	return client.Resource(k.GVR), nil
+}
+
+// GetObject reads one object of k's resource fresh from the cluster.
+func (s *Store) GetObject(k Key, namespace, name string) (*unstructured.Unstructured, error) {
+	ri, err := s.resource(k, namespace)
+	if err != nil {
+		return nil, err
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), s.timeout)
+	defer cancel()
+	return ri.Get(ctx, name, metav1.GetOptions{})
+}
+
+// Update replaces an object of k's resource. The object's resourceVersion
+// makes the server reject it if someone else changed the object meanwhile.
+func (s *Store) Update(k Key, obj *unstructured.Unstructured) (*unstructured.Unstructured, error) {
+	ri, err := s.resource(k, obj.GetNamespace())
+	if err != nil {
+		return nil, err
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), s.timeout)
+	defer cancel()
+	return ri.Update(ctx, obj, metav1.UpdateOptions{FieldManager: "coralctl"})
+}

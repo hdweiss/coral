@@ -1,47 +1,63 @@
 package ui
 
 import (
+	"image/color"
 	"strings"
 
+	"charm.land/bubbles/v2/textinput"
 	"charm.land/lipgloss/v2"
 	"github.com/charmbracelet/x/ansi"
+	"github.com/hdweiss/coralctl/internal/theme"
 )
 
+// Colors and styles of the UI, set by applyTheme.
 var (
-	colAccent  = lipgloss.Color("#FF7F50") // coral
-	colFg      = lipgloss.Color("#D8DEE9")
-	colMuted   = lipgloss.Color("#7B8494")
-	colBorder  = lipgloss.Color("#3B4252")
-	colSelBg   = lipgloss.Color("#3B4252")
-	colSelBgLo = lipgloss.Color("#2A303B")
-	colBarBg   = lipgloss.Color("#232831")
-	colGreen   = lipgloss.Color("#A3BE8C")
-	colYellow  = lipgloss.Color("#EBCB8B")
-	colRed     = lipgloss.Color("#BF616A")
-	colBlue    = lipgloss.Color("#81A1C1")
-	colCyan    = lipgloss.Color("#88C0D0")
-	colPurple  = lipgloss.Color("#B48EAD")
-	colOrange  = lipgloss.Color("#D08770")
+	colAccent, colFg, colMuted, colBorder, colSelBg, colSelBgLo, colBarBg color.Color
+	colGreen, colYellow, colRed, colBlue, colCyan, colPurple, colOrange   color.Color
+
+	stMuted, stAccent, stBold, stHeader, stErr, stWarn, stKey, stString, stNumber, stBool lipgloss.Style
+	stSel, stSelLo, stBar, stBarKey, stBarText, stLogo, stLink                            lipgloss.Style
 )
 
-var (
-	stMuted   = lipgloss.NewStyle().Foreground(colMuted)
-	stAccent  = lipgloss.NewStyle().Foreground(colAccent)
-	stBold    = lipgloss.NewStyle().Bold(true)
-	stHeader  = lipgloss.NewStyle().Foreground(colMuted).Bold(true)
-	stErr     = lipgloss.NewStyle().Foreground(colRed)
-	stWarn    = lipgloss.NewStyle().Foreground(colYellow)
-	stKey     = lipgloss.NewStyle().Foreground(colCyan)
-	stString  = lipgloss.NewStyle().Foreground(colGreen)
-	stNumber  = lipgloss.NewStyle().Foreground(colOrange)
-	stBool    = lipgloss.NewStyle().Foreground(colPurple)
-	stSel     = lipgloss.NewStyle().Background(colSelBg).Foreground(colFg).Bold(true)
-	stSelLo   = lipgloss.NewStyle().Background(colSelBgLo).Foreground(colFg)
-	stBar     = lipgloss.NewStyle().Background(colBarBg).Foreground(colFg)
-	stBarKey  = lipgloss.NewStyle().Background(colBarBg).Foreground(colAccent).Bold(true)
+func init() { applyTheme(theme.Default()) }
+
+// applyTheme sets the colors and styles of the UI. Views build their output
+// from these on every render, so the next frame shows the new theme.
+func applyTheme(t theme.Theme) {
+	c := lipgloss.Color
+	colAccent, colFg, colMuted, colBorder = c(t.Accent), c(t.Fg), c(t.Muted), c(t.Border)
+	colSelBg, colSelBgLo, colBarBg = c(t.SelBg), c(t.SelBgLo), c(t.BarBg)
+	colGreen, colYellow, colRed, colBlue = c(t.Green), c(t.Yellow), c(t.Red), c(t.Blue)
+	colCyan, colPurple, colOrange = c(t.Cyan), c(t.Purple), c(t.Orange)
+
+	stMuted = lipgloss.NewStyle().Foreground(colMuted)
+	stAccent = lipgloss.NewStyle().Foreground(colAccent)
+	stBold = lipgloss.NewStyle().Bold(true)
+	stHeader = lipgloss.NewStyle().Foreground(colMuted).Bold(true)
+	stErr = lipgloss.NewStyle().Foreground(colRed)
+	stWarn = lipgloss.NewStyle().Foreground(colYellow)
+	stKey = lipgloss.NewStyle().Foreground(colCyan)
+	stString = lipgloss.NewStyle().Foreground(colGreen)
+	stNumber = lipgloss.NewStyle().Foreground(colOrange)
+	stBool = lipgloss.NewStyle().Foreground(colPurple)
+	stSel = lipgloss.NewStyle().Background(colSelBg).Foreground(colFg).Bold(true)
+	stSelLo = lipgloss.NewStyle().Background(colSelBgLo).Foreground(colFg)
+	stBar = lipgloss.NewStyle().Background(colBarBg).Foreground(colFg)
+	stBarKey = lipgloss.NewStyle().Background(colBarBg).Foreground(colAccent).Bold(true)
 	stBarText = lipgloss.NewStyle().Background(colBarBg).Foreground(colMuted)
-	stLogo    = lipgloss.NewStyle().Background(colAccent).Foreground(lipgloss.Color("#1E222A")).Bold(true)
-)
+	stLogo = lipgloss.NewStyle().Background(colAccent).Foreground(c(t.LogoFg)).Bold(true)
+	stLink = lipgloss.NewStyle().Foreground(colBlue).Underline(true)
+}
+
+// inputStyles styles a text input in the theme colors with the given prompt.
+func inputStyles(prompt lipgloss.Style) textinput.Styles {
+	st := textinput.DefaultDarkStyles()
+	st.Focused.Prompt = prompt
+	st.Focused.Text = lipgloss.NewStyle().Foreground(colFg)
+	st.Focused.Placeholder = stMuted
+	st.Cursor.Color = colFg
+	return st
+}
 
 // statusStyle colors well-known status values.
 func statusStyle(s string) lipgloss.Style {

@@ -5,7 +5,9 @@ import (
 	"sort"
 	"sync"
 
+	"k8s.io/client-go/discovery"
 	"k8s.io/client-go/dynamic"
+	"k8s.io/client-go/openapi"
 	"k8s.io/client-go/rest"
 	"k8s.io/client-go/tools/clientcmd"
 	clientcmdapi "k8s.io/client-go/tools/clientcmd/api"
@@ -17,6 +19,9 @@ type Provider interface {
 	Current() string
 	DefaultNamespace(context string) string
 	Client(context string) (dynamic.Interface, error)
+	// OpenAPI returns the cluster's OpenAPI v3 client, or an error when the
+	// cluster has none (demo mode).
+	OpenAPI(context string) (openapi.Client, error)
 }
 
 type kubeProvider struct {
@@ -24,7 +29,9 @@ type kubeProvider struct {
 	raw   *clientcmdapi.Config
 
 	mu      sync.Mutex
+	configs map[string]*rest.Config
 	clients map[string]dynamic.Interface
+	openapi map[string]openapi.Client
 }
 
 // NewKubeProvider loads the kubeconfig from path, or from the default
@@ -41,7 +48,12 @@ func NewKubeProvider(path string) (Provider, error) {
 	if len(raw.Contexts) == 0 {
 		return nil, errors.New("no contexts found in kubeconfig (try --demo)")
 	}
-	return &kubeProvider{rules: rules, raw: raw, clients: map[string]dynamic.Interface{}}, nil
+	return &kubeProvider{
+		rules: rules, raw: raw,
+		configs: map[string]*rest.Config{},
+		clients: map[string]dynamic.Interface{},
+		openapi: map[string]openapi.Client{},
+	}, nil
 }
 
 func (p *kubeProvider) Contexts() []string {
@@ -67,11 +79,10 @@ func (p *kubeProvider) DefaultNamespace(context string) string {
 	return "default"
 }
 
-func (p *kubeProvider) Client(context string) (dynamic.Interface, error) {
-	p.mu.Lock()
-	defer p.mu.Unlock()
-	if c, ok := p.clients[context]; ok {
-		return c, nil
+// config returns the REST config of a context. p.mu must be held.
+func (p *kubeProvider) config(context string) (*rest.Config, error) {
+	if rc, ok := p.configs[context]; ok {
+		return rc, nil
 	}
 	cc := clientcmd.NewNonInteractiveClientConfig(*p.raw, context, &clientcmd.ConfigOverrides{}, p.rules)
 	rc, err := cc.ClientConfig()
@@ -81,10 +92,43 @@ func (p *kubeProvider) Client(context string) (dynamic.Interface, error) {
 	rc.QPS, rc.Burst = 50, 100
 	// Warnings would be printed on top of the TUI.
 	rc.WarningHandler = rest.NoWarnings{}
+	p.configs[context] = rc
+	return rc, nil
+}
+
+func (p *kubeProvider) Client(context string) (dynamic.Interface, error) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if c, ok := p.clients[context]; ok {
+		return c, nil
+	}
+	rc, err := p.config(context)
+	if err != nil {
+		return nil, err
+	}
 	c, err := dynamic.NewForConfig(rc)
 	if err != nil {
 		return nil, err
 	}
 	p.clients[context] = c
+	return c, nil
+}
+
+func (p *kubeProvider) OpenAPI(context string) (openapi.Client, error) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if c, ok := p.openapi[context]; ok {
+		return c, nil
+	}
+	rc, err := p.config(context)
+	if err != nil {
+		return nil, err
+	}
+	dc, err := discovery.NewDiscoveryClientForConfig(rc)
+	if err != nil {
+		return nil, err
+	}
+	c := dc.OpenAPIV3()
+	p.openapi[context] = c
 	return c, nil
 }

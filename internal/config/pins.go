@@ -1,13 +1,4 @@
-// Package config persists user state such as pinned clusters and namespaces.
 package config
-
-import (
-	"encoding/json"
-	"errors"
-	"io/fs"
-	"os"
-	"path/filepath"
-)
 
 // Pin is a favorite cluster (Namespace == "") or namespace of a cluster.
 type Pin struct {
@@ -22,51 +13,20 @@ type pinsFile struct {
 // PinsPath returns where pins are stored. Demo mode uses its own file so the
 // fake clusters never show up in the real list.
 func PinsPath(demo bool) string {
-	dir, err := os.UserConfigDir()
-	if err != nil {
-		return ""
-	}
-	name := "pins.json"
 	if demo {
-		name = "pins-demo.json"
+		return Path("pins-demo.json")
 	}
-	return filepath.Join(dir, "coralctl", name)
+	return Path("pins.json")
 }
 
 // LoadPins reads the pins at path. A missing file is no pins.
 func LoadPins(path string) ([]Pin, error) {
-	if path == "" {
-		return nil, nil
-	}
-	b, err := os.ReadFile(path)
-	if errors.Is(err, fs.ErrNotExist) {
-		return nil, nil
-	}
-	if err != nil {
-		return nil, err
-	}
 	var f pinsFile
-	if err := json.Unmarshal(b, &f); err != nil {
-		return nil, err
-	}
-	return f.Pins, nil
+	err := load(path, &f)
+	return f.Pins, err
 }
 
-// SavePins writes pins to path atomically. An empty path saves nothing.
+// SavePins writes pins to path. An empty path saves nothing.
 func SavePins(path string, pins []Pin) error {
-	if path == "" {
-		return nil
-	}
-	b, err := json.MarshalIndent(pinsFile{Pins: pins}, "", "  ")
-	if err != nil {
-		return err
-	}
-	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
-		return err
-	}
-	tmp := path + ".tmp"
-	if err := os.WriteFile(tmp, append(b, '\n'), 0o644); err != nil {
-		return err
-	}
-	return os.Rename(tmp, path)
+	return save(path, pinsFile{Pins: pins})
 }

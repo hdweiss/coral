@@ -1,6 +1,9 @@
 package yamltree
 
-import "testing"
+import (
+	"strings"
+	"testing"
+)
 
 func TestBuildOrderAndFolding(t *testing.T) {
 	obj := map[string]any{
@@ -48,5 +51,77 @@ func TestBuildOrderAndFolding(t *testing.T) {
 	again.ApplyExpansionState(state)
 	if again.Find(".spec").Expanded {
 		t.Fatal("expansion state not applied")
+	}
+}
+
+func TestArrange(t *testing.T) {
+	obj := map[string]any{
+		"spec": map[string]any{
+			"containers": []any{
+				map[string]any{"name": "a", "image": "x", "env": []any{"E"}},
+				map[string]any{"name": "b", "image": "y", "env": []any{"F"}},
+			},
+			"dnsPolicy":     "ClusterFirst",
+			"nodeName":      "n1",
+			"tolerations":   []any{"t"},
+			"schedulerName": "default",
+		},
+	}
+	root := Build(obj)
+	rules := map[string]string{
+		".spec.nodeName":         "fav",
+		".spec.containers[].env": "hide",
+		".spec.tolerations":      "hide",
+		".spec.schedulerName":    "hide",
+	}
+	is := func(rule string) func(*Node) bool {
+		return func(n *Node) bool { return rules[n.Pattern()] == rule }
+	}
+	root.Arrange(is("fav"), is("hide"))
+
+	spec := root.Find(".spec")
+	var keys []string
+	for _, c := range spec.Children {
+		keys = append(keys, c.Key)
+	}
+	if got := strings.Join(keys, ","); got != "nodeName,containers,dnsPolicy," {
+		t.Fatalf("spec children = %q", got)
+	}
+	group := spec.Children[3]
+	if group.Kind != Hidden || len(group.Children) != 2 || group.Expanded {
+		t.Fatalf("hidden group = %+v", group)
+	}
+	if spec.Fields() != 5 {
+		t.Fatalf("Fields = %d", spec.Fields())
+	}
+	// The rule for containers[].env applies to every container.
+	for _, c := range []string{".spec.containers[0]", ".spec.containers[1]"} {
+		ch := root.Find(c).Children
+		if last := ch[len(ch)-1]; last.Kind != Hidden || last.Children[0].Key != "env" {
+			t.Fatalf("%s: env not hidden: %+v", c, last)
+		}
+	}
+	if d := root.Find(".spec.tolerations[0]").HiddenDepth(); d != 1 {
+		t.Fatalf("HiddenDepth = %d", d)
+	}
+
+	// Unhiding brings the field back in its natural position, and the
+	// group's folding survives re-arranging.
+	group.Expanded = true
+	delete(rules, ".spec.tolerations")
+	root.Arrange(is("fav"), is("hide"))
+	keys = keys[:0]
+	for _, c := range spec.Children {
+		keys = append(keys, c.Key)
+	}
+	if got := strings.Join(keys, ","); got != "nodeName,containers,dnsPolicy,tolerations," {
+		t.Fatalf("after unhide = %q", got)
+	}
+	if !spec.Children[4].Expanded {
+		t.Fatal("hidden group lost its expanded state")
+	}
+	root.SetExpanded(false)
+	if !spec.Children[4].Expanded {
+		t.Fatal("collapse all should leave hidden groups alone")
 	}
 }

@@ -2,9 +2,13 @@ package ui
 
 import (
 	"fmt"
+	"slices"
 	"strings"
 
 	tea "charm.land/bubbletea/v2"
+	"charm.land/lipgloss/v2"
+	"github.com/charmbracelet/x/ansi"
+	"github.com/hdweiss/coralctl/internal/config"
 	"github.com/hdweiss/coralctl/internal/yamltree"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 )
@@ -19,6 +23,90 @@ type detailView struct {
 	lines  []*yamltree.Node
 	cursor int
 	offset int
+
+	fields *config.Fields // favorite and hidden fields per kind
+	info   infoState      // the "i" help popup
+}
+
+// fieldsChangedMsg asks the app to save the field preferences.
+type fieldsChangedMsg struct{}
+
+// kind is the key of the shown object's field preferences.
+func (d *detailView) kind() string {
+	return d.obj.GroupVersionKind().GroupKind().String()
+}
+
+// arrange applies the favorite and hidden fields of the object's kind.
+func (d *detailView) arrange() {
+	if d.fields == nil {
+		return
+	}
+	kind := d.kind()
+	d.root.Arrange(
+		func(n *yamltree.Node) bool { return d.fields.IsFavorite(kind, n.Pattern()) },
+		func(n *yamltree.Node) bool { return d.fields.IsHidden(kind, n.Pattern()) },
+	)
+}
+
+func (d *detailView) toggleFavorite(n *yamltree.Node) tea.Cmd {
+	if n == nil || !n.Arrangeable() || d.fields == nil {
+		return nil
+	}
+	d.fields.SetFavorite(d.kind(), n.Pattern(), !n.Favorite)
+	return d.rearranged(n)
+}
+
+func (d *detailView) toggleHidden(n *yamltree.Node) tea.Cmd {
+	if n == nil || !n.Arrangeable() || d.fields == nil {
+		return nil
+	}
+	d.fields.SetHidden(d.kind(), n.Pattern(), !n.IsHidden)
+	return d.rearranged(n)
+}
+
+// rearranged re-applies the rules after a change, following n if it is still
+// on screen and otherwise keeping the cursor on the same row.
+func (d *detailView) rearranged(n *yamltree.Node) tea.Cmd {
+	d.arrange()
+	d.relayout()
+	d.moveTo(n)
+	return emit(fieldsChangedMsg{})
+}
+
+// rowAction is a clickable button drawn at the right end of a row.
+type rowAction struct {
+	label string
+	run   func() tea.Cmd
+}
+
+// actions returns the buttons of a row: unhide on hidden fields, and
+// favorite and hide on the selected row.
+func (d *detailView) actions(n *yamltree.Node, selected bool) []rowAction {
+	if d.fields == nil || !n.Arrangeable() {
+		return nil
+	}
+	switch {
+	case n.IsHidden:
+		return []rowAction{{"unhide", func() tea.Cmd { return d.toggleHidden(n) }}}
+	case selected && n.HiddenDepth() == 0:
+		star := "☆"
+		if n.Favorite {
+			star = "★"
+		}
+		return []rowAction{
+			{star, func() tea.Cmd { return d.toggleFavorite(n) }},
+			{"hide", func() tea.Cmd { return d.toggleHidden(n) }},
+		}
+	}
+	return nil
+}
+
+func actionsWidth(acts []rowAction) int {
+	w := 0
+	for _, a := range acts {
+		w += ansi.StringWidth(a.label) + 2
+	}
+	return w
 }
 
 // SetObject shows obj. When obj is the same object as before (e.g. after a
@@ -46,6 +134,7 @@ func (d *detailView) SetObject(obj *unstructured.Unstructured) {
 	}
 	d.obj = obj
 	d.root = yamltree.Build(obj.Object)
+	d.arrange()
 	if same {
 		d.root.ApplyExpansionState(state)
 	} else {
@@ -90,6 +179,36 @@ func (d *detailView) toggle(n *yamltree.Node) {
 	}
 	n.Expanded = !n.Expanded
 	d.relayout()
+	if n.Kind == yamltree.Hidden && n.Expanded {
+		d.revealChildren(n)
+	}
+}
+
+// revealChildren scrolls so that as many of n's visible descendants as fit
+// are on screen, keeping n itself in view.
+func (d *detailView) revealChildren(n *yamltree.Node) {
+	i := slices.Index(d.lines, n)
+	if i < 0 {
+		return
+	}
+	last := i
+	for last+1 < len(d.lines) && isBelow(d.lines[last+1], n) {
+		last++
+	}
+	d.offset = clamp(max(d.offset, last-d.height()+1), 0, i)
+}
+
+// isBelow reports whether n is a descendant of group, through the group's
+// hidden children.
+func isBelow(n, group *yamltree.Node) bool {
+	for _, c := range group.Children {
+		for p := n; p != nil; p = p.Parent {
+			if p == c {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 func (d *detailView) Update(msg tea.Msg) tea.Cmd {
@@ -100,8 +219,18 @@ func (d *detailView) Update(msg tea.Msg) tea.Cmd {
 	switch msg := msg.(type) {
 	case tea.KeyPressMsg:
 		switch msg.String() {
+		case "i":
+			d.info.on = !d.info.on
+			if d.info.on {
+				return emit(needSchemaMsg{})
+			}
+			return nil
 		case "enter", "space", "o":
 			d.toggle(n)
+		case "f":
+			return d.toggleFavorite(n)
+		case "x":
+			return d.toggleHidden(n)
 		case "right", "l":
 			if n != nil && n.HasChildren() && !n.Expanded {
 				d.toggle(n)
@@ -136,8 +265,19 @@ func (d *detailView) Update(msg tea.Msg) tea.Cmd {
 			return nil
 		}
 		n := d.lines[i]
-		onGlyph := msg.x >= n.Depth*2 && msg.x <= n.Depth*2+1
-		if onGlyph || msg.double || i == d.cursor {
+		if acts := d.actions(n, i == d.cursor); len(acts) > 0 {
+			x := d.rect.w - 2 - actionsWidth(acts)
+			for _, a := range acts {
+				w := ansi.StringWidth(a.label) + 2
+				if msg.x >= x && msg.x < x+w {
+					return a.run()
+				}
+				x += w
+			}
+		}
+		indent := (n.Depth + n.HiddenDepth()) * 2
+		onGlyph := msg.x >= indent && msg.x <= indent+1
+		if onGlyph || msg.double || i == d.cursor || n.Kind == yamltree.Hidden {
 			d.toggle(n)
 		}
 		d.moveTo(n)
@@ -161,13 +301,19 @@ func (d *detailView) View() string {
 	footer := ""
 	if c := d.current(); c != nil {
 		footer = c.Path
+		if c.Kind == yamltree.Hidden {
+			footer = strings.TrimSpace(c.Parent.Path + " hidden fields")
+		}
 	}
 	title := d.obj.GetKind() + " " + d.obj.GetName()
 	return frame(title, footer, lines, d.rect.w, d.rect.h, d.focused)
 }
 
 func (d *detailView) renderLine(n *yamltree.Node, selected bool, w int) string {
-	indent := strings.Repeat("  ", n.Depth)
+	acts := d.actions(n, selected)
+	w -= actionsWidth(acts)
+	hidden := n.HiddenDepth() > 0
+	indent := strings.Repeat("  ", n.Depth+n.HiddenDepth())
 	glyph := "  "
 	if n.HasChildren() {
 		glyph = "▸ "
@@ -188,6 +334,12 @@ func (d *detailView) renderLine(n *yamltree.Node, selected bool, w int) string {
 	part(indent, none)
 	part(glyph, stMuted.Render)
 	switch {
+	case n.Kind == yamltree.Hidden:
+		label := fmt.Sprintf("⋯ %d hidden", len(n.Children))
+		if len(n.Children) == 1 {
+			label = "⋯ 1 hidden: " + n.Children[0].Key
+		}
+		part(label, stMuted.Italic(true).Render)
 	case n.Kind == yamltree.Line:
 		part(n.Value.(string), stString.Render)
 	case n.Index >= 0:
@@ -203,6 +355,9 @@ func (d *detailView) renderLine(n *yamltree.Node, selected bool, w int) string {
 		part(n.Key, stKey.Render)
 		part(":", stMuted.Render)
 	}
+	if n.Favorite {
+		part(" ★", stAccent.Render)
+	}
 
 	switch n.Kind {
 	case yamltree.Scalar:
@@ -217,7 +372,7 @@ func (d *detailView) renderLine(n *yamltree.Node, selected bool, w int) string {
 			if n.Kind == yamltree.List {
 				open, close = "[", "]"
 			}
-			part(fmt.Sprintf(" %s…%d%s", open, len(n.Children), close), stMuted.Render)
+			part(fmt.Sprintf(" %s…%d%s", open, n.Fields(), close), stMuted.Render)
 		} else if len(n.Children) == 0 {
 			if n.Kind == yamltree.List {
 				part(" []", stMuted.Render)
@@ -237,9 +392,20 @@ func (d *detailView) renderLine(n *yamltree.Node, selected bool, w int) string {
 		if d.focused {
 			st = stSel
 		}
-		return st.Render(fit(plain.String(), w))
+		return st.Render(fit(plain.String(), w)) + renderActions(acts, st.Foreground(colAccent))
 	}
-	return styled.String()
+	if hidden {
+		return stMuted.Render(fit(plain.String(), w)) + renderActions(acts, stMuted)
+	}
+	return fit(styled.String(), w) + renderActions(acts, stAccent)
+}
+
+func renderActions(acts []rowAction, st lipgloss.Style) string {
+	var sb strings.Builder
+	for _, a := range acts {
+		sb.WriteString(st.Render(" " + a.label + " "))
+	}
+	return sb.String()
 }
 
 func formatScalar(v any) (string, func(...string) string) {

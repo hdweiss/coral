@@ -31,10 +31,7 @@ func newPalette(items []paletteItem, initial string) *palette {
 	ti := textinput.New()
 	ti.Prompt = ": "
 	ti.Placeholder = "resource, ns <name>, ctx <name>, quit"
-	st := textinput.DefaultDarkStyles()
-	st.Focused.Prompt = stAccent.Bold(true)
-	st.Focused.Placeholder = stMuted
-	ti.SetStyles(st)
+	ti.SetStyles(inputStyles(stAccent.Bold(true)))
 	ti.SetValue(initial)
 	ti.CursorEnd()
 	ti.Focus()

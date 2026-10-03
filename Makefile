@@ -15,7 +15,7 @@ run: build
 
 ## demo: build and start with the fake demo clusters
 demo: build
-	./$(BIN) --demo
+	./$(BIN) --demo --theme kanagawa
 
 test:
 	go test ./...

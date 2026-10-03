@@ -6,11 +6,13 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"strings"
 	"time"
 
 	tea "charm.land/bubbletea/v2"
 	"github.com/hdweiss/coralctl/internal/config"
 	"github.com/hdweiss/coralctl/internal/k8s"
+	"github.com/hdweiss/coralctl/internal/theme"
 	"github.com/hdweiss/coralctl/internal/ui"
 	"github.com/spf13/cobra"
 	"k8s.io/klog/v2"
@@ -30,6 +32,7 @@ func rootCmd() *cobra.Command {
 		opts       ui.Options
 		demo       bool
 		timeout    time.Duration
+		themeSpec  string
 	)
 	cmd := &cobra.Command{
 		Use:           "coralctl",
@@ -48,8 +51,12 @@ func rootCmd() *cobra.Command {
 			} else if p, err = k8s.NewKubeProvider(kubeconfig); err != nil {
 				return err
 			}
+			if opts.Theme, err = theme.Resolve(themeSpec); err != nil {
+				return err
+			}
 			opts.Version = version
 			opts.PinsPath = config.PinsPath(demo)
+			opts.FieldsPath = config.FieldsPath()
 			app, err := ui.New(k8s.NewStore(p, timeout), opts)
 			if err != nil {
 				return err
@@ -66,6 +73,8 @@ func rootCmd() *cobra.Command {
 	f.DurationVar(&opts.Refresh, "refresh", 10*time.Second, "background refresh interval of the visible list (0 disables)")
 	f.DurationVar(&timeout, "timeout", 30*time.Second, "timeout for API requests")
 	f.BoolVar(&demo, "demo", false, "use a built-in fake cluster")
+	f.StringVar(&themeSpec, "theme", envOr("CORALCTL_THEME", "auto"),
+		`colors: "auto" (Omarchy's when installed, else coral), "omarchy", a built-in theme (`+strings.Join(theme.Names(), ", ")+`), or a path to an Omarchy colors.toml or theme directory ($CORALCTL_THEME)`)
 
 	cmd.AddCommand(&cobra.Command{
 		Use:   "version",
@@ -73,6 +82,13 @@ func rootCmd() *cobra.Command {
 		Run:   func(cmd *cobra.Command, args []string) { fmt.Println("coralctl", version) },
 	})
 	return cmd
+}
+
+func envOr(key, def string) string {
+	if v := os.Getenv(key); v != "" {
+		return v
+	}
+	return def
 }
 
 // silenceKlog stops client-go from logging over the TUI.
