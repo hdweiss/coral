@@ -2,7 +2,7 @@ BIN     := bin/coralctl
 VERSION ?= $(shell git describe --tags --always --dirty 2>/dev/null || echo dev)
 LDFLAGS := -s -w -X main.version=$(VERSION)
 
-.PHONY: all build run demo test vet fmt check install clean
+.PHONY: all build run demo test vet fmt check install clean release-snapshot
 
 all: build
 
@@ -37,3 +37,7 @@ install:
 
 clean:
 	rm -rf bin
+
+## release-snapshot: build all release archives into dist/ without publishing
+release-snapshot:
+	goreleaser release --snapshot --clean --parallelism 1

@@ -15,7 +15,15 @@ A mouse-first Kubernetes TUI with tree views, inspired by [k9s](https://k9scli.i
 
 ## Install
 
-Requires Go 1.26+.
+With [mise](https://mise.jdx.dev), from the prebuilt GitHub releases:
+
+```sh
+mise use -g github:hdweiss/coral
+```
+
+Or download an archive for your platform from the [releases page](https://github.com/hdweiss/coral/releases).
+
+From source (requires Go 1.26+):
 
 ```sh
 make install        # or: go install ./cmd/coralctl
