@@ -203,10 +203,13 @@ func (a *App) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	var cmd tea.Cmd
 	switch msg := msg.(type) {
 	case tea.WindowSizeMsg:
-		a.w, a.h = msg.Width, msg.Height
 		if a.detailW == 0 {
-			a.detailW = (a.w - a.navW) * 45 / 100
+			a.detailW = (msg.Width - a.navW) * 45 / 100
+		} else if a.w > a.navW {
+			// Keep the detail panel's share of the space right of the navigator.
+			a.detailW = a.detailW * (msg.Width - a.navW) / (a.w - a.navW)
 		}
+		a.w, a.h = msg.Width, msg.Height
 		a.layout()
 	case fetchedMsg:
 		delete(a.loading, msg.key)

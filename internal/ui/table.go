@@ -36,7 +36,9 @@ type tableView struct {
 	filter   string
 
 	selUID string // keeps the selection on the same object across refreshes
-	colX   []int  // start x of each column, for header clicks
+	widths []int  // last rendered column widths; 0 means hidden
+	colX   []int  // start x of each visible column, for header clicks
+	colIdx []int  // column index of each entry in colX
 }
 
 func (t *tableView) SetResource(key k8s.Key, res k8s.Resource) {
@@ -50,6 +52,7 @@ func (t *tableView) SetResource(key k8s.Key, res k8s.Resource) {
 	}
 	t.sortCol, t.sortDesc = 0, false
 	t.cursor, t.offset, t.selUID = 0, 0, ""
+	t.widths = nil
 	t.filter = ""
 	t.hasData = false
 	t.entry = k8s.Entry{}
@@ -160,7 +163,7 @@ func (t *tableView) Update(msg tea.Msg) tea.Cmd {
 	case tea.KeyPressMsg:
 		switch msg.String() {
 		case "s":
-			t.sortCol, t.sortDesc = (t.sortCol+1)%max(len(t.cols), 1), false
+			t.sortCol, t.sortDesc = t.nextVisibleCol(t.sortCol), false
 			t.rebuild()
 		case "S":
 			t.sortBy(t.sortCol)
@@ -173,7 +176,7 @@ func (t *tableView) Update(msg tea.Msg) tea.Cmd {
 		if msg.y == 0 {
 			for i := len(t.colX) - 1; i >= 0; i-- {
 				if msg.x >= t.colX[i] {
-					t.sortBy(i)
+					t.sortBy(t.colIdx[i])
 					break
 				}
 			}
@@ -198,6 +201,18 @@ func (t *tableView) Update(msg tea.Msg) tea.Cmd {
 	t.remember()
 	t.offset = scrollTo(t.cursor, t.offset, t.height())
 	return nil
+}
+
+// nextVisibleCol returns the column after c, skipping hidden columns.
+func (t *tableView) nextVisibleCol(c int) int {
+	n := max(len(t.cols), 1)
+	for range n {
+		c = (c + 1) % n
+		if c >= len(t.widths) || t.widths[c] > 0 {
+			return c
+		}
+	}
+	return c
 }
 
 type openDetailMsg struct{}
@@ -254,88 +269,145 @@ func (t *tableView) View() string {
 	return frame(t.title(), footer, lines, t.rect.w, t.rect.h, t.focused)
 }
 
-const colGap = 2
+const (
+	colGap      = 2
+	nameSoftMin = 24 // NAME shrinks to this before optional columns are hidden
+	nameHardMin = 12
+)
 
 func (t *tableView) columnWidths(avail int) []int {
-	w := make([]int, len(t.cols))
+	natural := make([]int, len(t.cols))
 	for i, c := range t.cols {
-		w[i] = len(c.Name) + 2 // room for the sort arrow
+		natural[i] = len(c.Name) + 1 // room for the sort arrow
 	}
 	for _, r := range t.rows {
 		for i, c := range r.cells {
-			w[i] = max(w[i], ansi.StringWidth(c))
+			natural[i] = max(natural[i], ansi.StringWidth(c))
 		}
 	}
-	for i := range w {
-		w[i] = min(w[i], 60)
+	for i := range natural {
+		natural[i] = min(natural[i], 60)
 	}
-	total := (len(w) - 1) * colGap
-	for _, x := range w {
-		total += x
+	t.widths = layoutColumns(t.cols, natural, avail, t.sortCol)
+	return t.widths
+}
+
+// layoutColumns fits columns of the given natural widths into avail cells.
+// It shrinks NAME to a comfortable width first, then hides optional columns
+// (highest Drop first), then shrinks NAME down to its hard minimum, and
+// finally hides columns from the right. A width
+// of 0 means the column is hidden. The keep column is never hidden.
+func layoutColumns(cols []k8s.Column, natural []int, avail, keep int) []int {
+	w := slices.Clone(natural)
+	over := func() int {
+		total, n := 1, 0 // leading space
+		for _, x := range w {
+			if x > 0 {
+				total += x
+				n++
+			}
+		}
+		return total + max(n-1, 0)*colGap - avail
 	}
-	// Shrink the name column first, it is the one most worth truncating.
-	nameCol := slices.IndexFunc(t.cols, func(c k8s.Column) bool { return c.Name == "NAME" })
-	if over := total - avail + 1; over > 0 && nameCol >= 0 {
-		w[nameCol] = max(w[nameCol]-over, 12)
+	nameCol := slices.IndexFunc(cols, func(c k8s.Column) bool { return c.Name == "NAME" })
+	shrinkName := func(floor int) {
+		if o := over(); o > 0 && nameCol >= 0 {
+			w[nameCol] = max(w[nameCol]-o, min(natural[nameCol], floor))
+		}
+	}
+
+	shrinkName(nameSoftMin)
+	var optional []int
+	for i, c := range cols {
+		if c.Drop > 0 && i != keep {
+			optional = append(optional, i)
+		}
+	}
+	slices.SortStableFunc(optional, func(a, b int) int {
+		return cmp.Or(cmp.Compare(cols[b].Drop, cols[a].Drop), cmp.Compare(b, a))
+	})
+	for _, i := range optional {
+		if over() <= 0 {
+			break
+		}
+		w[i] = 0
+	}
+	shrinkName(nameHardMin)
+	// Last resort: hide columns from the right rather than cutting the row.
+	for i := len(w) - 1; i >= 0 && over() > 0; i-- {
+		if i != nameCol && i != keep {
+			w[i] = 0
+		}
 	}
 	return w
 }
 
 func (t *tableView) renderHeader(widths []int) string {
-	t.colX = t.colX[:0]
-	var sb strings.Builder
+	t.colX, t.colIdx = t.colX[:0], t.colIdx[:0]
+	var cells []string
 	x := 1
-	sb.WriteString(" ")
 	for i, c := range t.cols {
+		if widths[i] == 0 {
+			continue
+		}
 		t.colX = append(t.colX, x)
-		name := c.Name
+		t.colIdx = append(t.colIdx, i)
+		x += widths[i] + colGap
 		if i == t.sortCol {
 			arrow := "↑"
 			if t.sortDesc {
 				arrow = "↓"
 			}
-			sb.WriteString(stAccent.Bold(true).Render(fit(name+arrow, widths[i])))
+			cells = append(cells, stAccent.Bold(true).Render(fit(c.Name+arrow, widths[i])))
 		} else {
-			sb.WriteString(stHeader.Render(fit(name, widths[i])))
+			cells = append(cells, stHeader.Render(fit(c.Name, widths[i])))
 		}
-		sb.WriteString(strings.Repeat(" ", colGap))
-		x += widths[i] + colGap
 	}
-	return sb.String()
+	return joinCells(cells)
+}
+
+// joinCells lays out rendered cells with the leading space and column gaps.
+func joinCells(cells []string) string {
+	return " " + strings.Join(cells, strings.Repeat(" ", colGap))
 }
 
 func (t *tableView) renderRow(r tableRow, widths []int, selected bool, iw int) string {
-	if selected {
-		var sb strings.Builder
-		sb.WriteString(" ")
-		for i, c := range r.cells {
-			sb.WriteString(fit(c, widths[i]) + strings.Repeat(" ", colGap))
+	var cells []string
+	for i, c := range r.cells {
+		if widths[i] == 0 {
+			continue
 		}
+		cell := fit(c, widths[i])
+		if !selected { // the selection is drawn with one uniform highlight
+			cell = cellStyle(t.cols[i].Name, c, cell)
+		}
+		cells = append(cells, cell)
+	}
+	if selected {
 		st := stSelLo
 		if t.focused {
 			st = stSel
 		}
-		return st.Render(fit(sb.String(), iw))
+		return st.Render(fit(joinCells(cells), iw))
 	}
-	var sb strings.Builder
-	sb.WriteString(" ")
-	for i, c := range r.cells {
-		cell := fit(c, widths[i])
-		switch t.cols[i].Name {
-		case "STATUS":
-			cell = statusStyle(c).Render(cell)
-		case "NAMESPACE", "AGE":
-			cell = stMuted.Render(cell)
-		case "RESTARTS":
-			if c != "0" {
-				cell = stWarn.Render(cell)
-			}
-		case "READY":
-			if a, b, ok := strings.Cut(c, "/"); ok && a != b {
-				cell = stWarn.Render(cell)
-			}
+	return joinCells(cells)
+}
+
+// cellStyle colors a padded cell by the meaning of its raw value.
+func cellStyle(col, raw, cell string) string {
+	switch col {
+	case "STATUS":
+		return statusStyle(raw).Render(cell)
+	case "NAMESPACE", "AGE":
+		return stMuted.Render(cell)
+	case "RESTARTS":
+		if raw != "0" {
+			return stWarn.Render(cell)
 		}
-		sb.WriteString(cell + strings.Repeat(" ", colGap))
+	case "READY":
+		if a, b, ok := strings.Cut(raw, "/"); ok && a != b {
+			return stWarn.Render(cell)
+		}
 	}
-	return sb.String()
+	return cell
 }

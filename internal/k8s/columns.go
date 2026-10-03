@@ -17,7 +17,13 @@ type Column struct {
 	Value func(u *unstructured.Unstructured) string
 	// Sort returns the sort key (int64 or string). Nil means sort by Value.
 	Sort func(u *unstructured.Unstructured) any
+	// Drop marks a column the table may hide when space runs out. Zero means
+	// always shown; higher values are hidden first.
+	Drop int
 }
+
+// dropFirst returns c marked as hideable with priority p.
+func (c Column) dropFirst(p int) Column { c.Drop = p; return c }
 
 var (
 	colName = Column{Name: "NAME", Value: func(u *unstructured.Unstructured) string { return u.GetName() }}
@@ -38,15 +44,15 @@ func Columns(r Resource) []Column {
 			col("READY", podReady),
 			col("STATUS", PodStatus),
 			intCol("RESTARTS", podRestarts),
-			col("IP", field("status", "podIP")),
-			col("NODE", field("spec", "nodeName")),
+			col("IP", field("status", "podIP")).dropFirst(2),
+			col("NODE", field("spec", "nodeName")).dropFirst(1),
 			colAge}
 	case "deployments", "statefulsets":
 		return []Column{colName,
 			col("READY", func(u *unstructured.Unstructured) string {
 				return fmt.Sprintf("%d/%d", num(u, "status", "readyReplicas"), num(u, "spec", "replicas"))
 			}),
-			intCol("UP-TO-DATE", func(u *unstructured.Unstructured) int64 { return num(u, "status", "updatedReplicas") }),
+			intCol("UP-TO-DATE", func(u *unstructured.Unstructured) int64 { return num(u, "status", "updatedReplicas") }).dropFirst(1),
 			intCol("AVAILABLE", func(u *unstructured.Unstructured) int64 { return num(u, "status", "availableReplicas") }),
 			colAge}
 	case "daemonsets":
@@ -97,7 +103,7 @@ func Columns(r Resource) []Column {
 	case "services":
 		return []Column{colName,
 			col("TYPE", field("spec", "type")),
-			col("CLUSTER-IP", field("spec", "clusterIP")),
+			col("CLUSTER-IP", field("spec", "clusterIP")).dropFirst(1),
 			col("PORTS", servicePorts),
 			colAge}
 	case "ingresses":
@@ -134,9 +140,9 @@ func Columns(r Resource) []Column {
 	case "persistentvolumeclaims":
 		return []Column{colName,
 			col("STATUS", field("status", "phase")),
-			col("VOLUME", field("spec", "volumeName")),
+			col("VOLUME", field("spec", "volumeName")).dropFirst(2),
 			col("CAPACITY", field("status", "capacity", "storage")),
-			col("STORAGECLASS", field("spec", "storageClassName")),
+			col("STORAGECLASS", field("spec", "storageClassName")).dropFirst(1),
 			colAge}
 	case "persistentvolumes":
 		return []Column{colName,
@@ -149,7 +155,7 @@ func Columns(r Resource) []Column {
 				}
 				return ns + "/" + str(u, "spec", "claimRef", "name")
 			}),
-			col("STORAGECLASS", field("spec", "storageClassName")),
+			col("STORAGECLASS", field("spec", "storageClassName")).dropFirst(1),
 			colAge}
 	case "nodes":
 		return []Column{colName,
