@@ -9,6 +9,7 @@ import (
 	"time"
 
 	tea "charm.land/bubbletea/v2"
+	"github.com/hdweiss/coralctl/internal/config"
 	"github.com/hdweiss/coralctl/internal/k8s"
 	"github.com/hdweiss/coralctl/internal/ui"
 	"github.com/spf13/cobra"
@@ -48,6 +49,7 @@ func rootCmd() *cobra.Command {
 				return err
 			}
 			opts.Version = version
+			opts.PinsPath = config.PinsPath(demo)
 			app, err := ui.New(k8s.NewStore(p, timeout), opts)
 			if err != nil {
 				return err

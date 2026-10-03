@@ -11,6 +11,7 @@ import (
 	tea "charm.land/bubbletea/v2"
 	"charm.land/lipgloss/v2"
 	"github.com/charmbracelet/x/ansi"
+	"github.com/hdweiss/coralctl/internal/config"
 	"github.com/hdweiss/coralctl/internal/k8s"
 	"k8s.io/apimachinery/pkg/util/duration"
 )
@@ -21,6 +22,7 @@ type Options struct {
 	AllNamespaces bool
 	Refresh       time.Duration // background refresh of the visible list; 0 disables
 	Version       string
+	PinsPath      string // where pins are saved; "" keeps them in memory only
 }
 
 type focusID int
@@ -29,6 +31,7 @@ const (
 	focusNav focusID = iota
 	focusTable
 	focusDetail
+	focusPins
 )
 
 type (
@@ -58,6 +61,7 @@ type App struct {
 	opts  Options
 
 	w, h   int
+	pins   *pinsView
 	nav    *navView
 	table  *tableView
 	detail *detailView
@@ -129,6 +133,14 @@ func New(store *k8s.Store, opts Options) (*App, error) {
 		navW:        30,
 		filterInput: fi,
 	}
+	contexts := p.Contexts()
+	a.pins = &pinsView{known: func(c string) bool { return slices.Contains(contexts, c) }}
+	if pins, err := config.LoadPins(opts.PinsPath); err != nil {
+		a.setFlash("loading pins: "+err.Error(), true)
+	} else {
+		a.pins.pins = pins
+	}
+	a.nav.pinned = a.pins.has
 	a.nav.root(ctx).expanded = true
 	a.nav.refresh()
 	a.setFocus(focusTable)
@@ -188,11 +200,72 @@ func (a *App) activate(key k8s.Key, res k8s.Resource) tea.Cmd {
 func (a *App) syncDetail() { a.detail.SetObject(a.table.Selected()) }
 
 func (a *App) setFocus(f focusID) {
+	if f == focusPins && len(a.pins.pins) == 0 {
+		f = focusNav
+	}
 	a.focus = f
+	a.pins.focused = f == focusPins
 	a.nav.focused = f == focusNav
 	a.table.focused = f == focusTable
 	a.detail.focused = f == focusDetail
 	a.layout()
+}
+
+// cycleFocus moves focus by step through the panels in screen order.
+func (a *App) cycleFocus(step int) {
+	order := []focusID{focusNav, focusTable, focusDetail}
+	if len(a.pins.pins) > 0 {
+		order = append([]focusID{focusPins}, order...)
+	}
+	i := max(slices.Index(order, a.focus), 0)
+	a.setFocus(order[(i+step+len(order))%len(order)])
+}
+
+// currentPin is what pinning "here" means: the current namespace, or the
+// cluster when looking at all namespaces or a cluster-scoped resource.
+func (a *App) currentPin() config.Pin {
+	if a.table.res.Namespaced {
+		return config.Pin{Context: a.ctx, Namespace: a.ns}
+	}
+	return config.Pin{Context: a.ctx}
+}
+
+func (a *App) togglePin(pin config.Pin) {
+	added := a.pins.toggle(pin)
+	label := "⎈ " + pin.Context
+	if pin.Namespace != "" {
+		label = pin.Context + " › " + pin.Namespace
+	}
+	if added {
+		a.setFlash("pinned "+label, false)
+	} else {
+		a.setFlash("unpinned "+label, false)
+	}
+	if err := config.SavePins(a.opts.PinsPath, a.pins.pins); err != nil {
+		a.setFlash("saving pins: "+err.Error(), true)
+	}
+	if a.focus == focusPins && len(a.pins.pins) == 0 {
+		a.setFocus(focusNav)
+	}
+	a.layout()
+}
+
+// openPin jumps to a pinned cluster or namespace, keeping the resource type
+// when it makes sense there.
+func (a *App) openPin(pin config.Pin) tea.Cmd {
+	if !slices.Contains(a.store.Provider().Contexts(), pin.Context) {
+		a.setFlash("context "+pin.Context+" is not in the kubeconfig", true)
+		return nil
+	}
+	res, _ := k8s.Lookup(a.table.res.Name)
+	ns := pin.Namespace
+	if ns == "" {
+		ns = a.store.Provider().DefaultNamespace(pin.Context)
+	} else if !res.Namespaced {
+		res = k8s.MustLookup("pods")
+	}
+	a.nav.root(pin.Context).expanded = true
+	return a.activate(a.keyFor(pin.Context, ns, res), res)
 }
 
 func (a *App) setFlash(msg string, isErr bool) {
@@ -235,6 +308,10 @@ func (a *App) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		cmd = a.fetch(k8s.Key{Context: msg.context, GVR: nsGVR})
 	case openDetailMsg:
 		a.setFocus(focusDetail)
+	case togglePinMsg:
+		a.togglePin(msg.pin)
+	case openPinMsg:
+		cmd = a.openPin(msg.pin)
 	case tickMsg:
 		cmds := []tea.Cmd{tick()}
 		if e, ok := a.store.Get(a.cur); ok && a.opts.Refresh > 0 && time.Since(e.FetchedAt) >= a.opts.Refresh {
@@ -305,10 +382,13 @@ func (a *App) handleKey(msg tea.KeyPressMsg) tea.Cmd {
 		a.help = true
 		return nil
 	case "tab":
-		a.setFocus((a.focus + 1) % 3)
+		a.cycleFocus(1)
 		return nil
 	case "shift+tab":
-		a.setFocus((a.focus + 2) % 3)
+		a.cycleFocus(-1)
+		return nil
+	case "0":
+		a.setFocus(focusPins)
 		return nil
 	case "1", "2", "3":
 		a.setFocus(focusID(key[0] - '1'))
@@ -330,7 +410,7 @@ func (a *App) handleKey(msg tea.KeyPressMsg) tea.Cmd {
 			a.syncDetail()
 		case a.focus == focusDetail:
 			a.setFocus(focusTable)
-		case a.focus == focusTable:
+		case a.focus == focusTable, a.focus == focusPins:
 			a.setFocus(focusNav)
 		}
 		return nil
@@ -338,6 +418,8 @@ func (a *App) handleKey(msg tea.KeyPressMsg) tea.Cmd {
 
 	var cmd tea.Cmd
 	switch a.focus {
+	case focusPins:
+		cmd = a.pins.Update(msg)
 	case focusNav:
 		cmd = a.nav.Update(msg)
 	case focusTable:
@@ -474,6 +556,7 @@ type panelRef struct {
 
 func (a *App) panels() []panelRef {
 	return []panelRef{
+		{focusPins, a.pins.rect, a.pins.Update},
 		{focusNav, a.nav.rect, a.nav.Update},
 		{focusTable, a.table.rect, a.table.Update},
 		{focusDetail, a.detail.rect, a.detail.Update},
@@ -506,11 +589,13 @@ func (a *App) layout() {
 	}
 	bodyY, bodyH := 1, max(a.h-2, 3)
 	full := rect{0, bodyY, a.w, bodyH}
-	a.nav.rect, a.table.rect, a.detail.rect = rect{}, rect{}, rect{}
+	a.pins.rect, a.nav.rect, a.table.rect, a.detail.rect = rect{}, rect{}, rect{}, rect{}
 
 	narrow := a.w < narrowWidth
 	if a.zoom || (narrow && a.focus == focusDetail) {
 		switch a.focus {
+		case focusPins:
+			a.pins.rect = full
 		case focusNav:
 			a.nav.rect = full
 		case focusTable:
@@ -523,21 +608,29 @@ func (a *App) layout() {
 	}
 
 	a.navW = clamp(a.navW, 16, a.w/2)
+	// The pinned box sits on top of the navigator and takes at most a third
+	// of the column.
+	pinsH := min(a.pins.wantHeight(), max(bodyH/3, 3))
+	a.pins.rect = rect{0, bodyY, a.navW, pinsH}
+	if pinsH == 0 {
+		a.pins.rect = rect{}
+	}
 	if narrow {
-		a.nav.rect = rect{0, bodyY, a.navW, bodyH}
+		a.nav.rect = rect{0, bodyY + pinsH, a.navW, bodyH - pinsH}
 		a.table.rect = rect{a.navW, bodyY, a.w - a.navW, bodyH}
 		a.clampScroll()
 		return
 	}
 	a.detailW = clamp(a.detailW, 24, a.w-a.navW-30)
 	tableW := a.w - a.navW - a.detailW
-	a.nav.rect = rect{0, bodyY, a.navW, bodyH}
+	a.nav.rect = rect{0, bodyY + pinsH, a.navW, bodyH - pinsH}
 	a.table.rect = rect{a.navW, bodyY, tableW, bodyH}
 	a.detail.rect = rect{a.navW + tableW, bodyY, a.detailW, bodyH}
 	a.clampScroll()
 }
 
 func (a *App) clampScroll() {
+	a.pins.offset = scrollTo(a.pins.cursor, a.pins.offset, a.pins.height())
 	a.nav.offset = scrollTo(a.nav.cursor, a.nav.offset, a.nav.height())
 	a.table.offset = scrollTo(a.table.cursor, a.table.offset, a.table.height())
 	a.detail.offset = scrollTo(a.detail.cursor, a.detail.offset, a.detail.height())
@@ -559,6 +652,14 @@ func (a *App) openPalette(initial string) tea.Cmd {
 	for _, c := range a.store.Provider().Contexts() {
 		items = append(items, paletteItem{cmd: "ctx " + c, desc: "switch context"})
 	}
+	pinDesc := "pin this namespace"
+	if pin := a.currentPin(); a.pins.has(pin) {
+		pinDesc = "unpin this namespace"
+	}
+	if !a.table.res.Namespaced {
+		pinDesc = strings.Replace(pinDesc, "namespace", "cluster", 1)
+	}
+	items = append(items, paletteItem{cmd: "pin", desc: pinDesc, aliases: []string{"unpin"}})
 	items = append(items, paletteItem{cmd: "quit", desc: "exit coral", aliases: []string{"q"}})
 	a.palette = newPalette(items, initial)
 	return a.palette.input.Focus()
@@ -573,6 +674,9 @@ func (a *App) runCommand(text string) tea.Cmd {
 	switch f[0] {
 	case "q", "quit", "q!":
 		return tea.Quit
+	case "pin", "unpin":
+		a.togglePin(a.currentPin())
+		return nil
 	case "ctx", "context":
 		if len(f) < 2 {
 			return a.openPalette("ctx ")
@@ -632,8 +736,14 @@ func (a *App) View() tea.View {
 	}
 	a.buttons = a.buttons[:0]
 
+	a.pins.ctx, a.pins.ns, a.pins.nsScoped = a.ctx, a.ns, a.table.res.Namespaced
 	var parts []string
-	if a.nav.rect.w > 0 {
+	switch {
+	case a.pins.rect.h > 0 && a.nav.rect.h > 0:
+		parts = append(parts, a.pins.View()+"\n"+a.nav.View())
+	case a.pins.rect.h > 0:
+		parts = append(parts, a.pins.View())
+	case a.nav.rect.w > 0:
 		parts = append(parts, a.nav.View())
 	}
 	if a.table.rect.w > 0 {
@@ -686,6 +796,11 @@ func (a *App) renderHeader() string {
 		seg(sep, nil)
 		seg(stBar.Render(ns), func() tea.Cmd { return a.openPalette("ns ") })
 	}
+	star := stBarText.Render(" ☆")
+	if a.pins.has(a.currentPin()) {
+		star = stBarKey.Render(" ★")
+	}
+	seg(star, func() tea.Cmd { a.togglePin(a.currentPin()); return nil })
 	seg(sep, nil)
 	seg(stBar.Foreground(colAccent).Bold(true).Render(a.table.res.Title), func() tea.Cmd { return a.openPalette("") })
 	if o := a.table.Selected(); o != nil {
@@ -725,10 +840,14 @@ func (a *App) renderStatus() string {
 		{":", "command", func() tea.Cmd { return a.openPalette("") }},
 		{"/", "filter", a.startFilter},
 		{"r", "refresh", func() tea.Cmd { return a.handleKey(tea.KeyPressMsg{Code: 'r', Text: "r"}) }},
-		{"tab", "focus", func() tea.Cmd { a.setFocus((a.focus + 1) % 3); return nil }},
+		{"tab", "focus", func() tea.Cmd { a.cycleFocus(1); return nil }},
 		{"z", "zoom", func() tea.Cmd { a.zoom = !a.zoom; a.layout(); return nil }},
 	}
 	switch a.focus {
+	case focusNav:
+		hints = append(hints, hint{"p", "pin", func() tea.Cmd { return a.nav.Update(tea.KeyPressMsg{Code: 'p', Text: "p"}) }})
+	case focusPins:
+		hints = append(hints, hint{"p", "unpin", func() tea.Cmd { return a.pins.Update(tea.KeyPressMsg{Code: 'p', Text: "p"}) }})
 	case focusTable:
 		hints = append(hints, hint{"s", "sort", func() tea.Cmd { return a.table.Update(tea.KeyPressMsg{Code: 's', Text: "s"}) }})
 	case focusDetail:
@@ -772,7 +891,8 @@ func helpView() string {
 		{"Global", [][2]string{
 			{":", "command palette (po, deploy, ns <name>, ctx <name>)"},
 			{"/", "filter the table"},
-			{"tab / 1 2 3", "focus navigator / table / details"},
+			{"tab / 0 1 2 3", "focus pinned / navigator / table / details"},
+			{"p", "pin / unpin the namespace or cluster (also :pin)"},
 			{"z", "zoom the focused panel"},
 			{"r", "refresh"},
 			{"esc", "back / clear filter / unzoom"},
@@ -793,6 +913,7 @@ func helpView() string {
 			{"drag border", "resize panels"},
 			{"wheel", "scroll the panel under the pointer"},
 			{"click breadcrumb", "switch context / namespace / resource"},
+			{"click ☆ / ×", "pin where you are / unpin"},
 		}},
 	}
 	var lines []string

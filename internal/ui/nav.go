@@ -5,6 +5,7 @@ import (
 	"strings"
 
 	tea "charm.land/bubbletea/v2"
+	"github.com/hdweiss/coralctl/internal/config"
 	"github.com/hdweiss/coralctl/internal/k8s"
 )
 
@@ -62,6 +63,7 @@ type navView struct {
 	active  k8s.Key
 	loaded  map[string]bool // contexts whose namespaces arrived
 	pending *activateMsg    // reveal once namespaces load
+	pinned  func(config.Pin) bool
 }
 
 func newNavView(store *k8s.Store) *navView {
@@ -223,6 +225,20 @@ func (v *navView) activate(n *navNode) tea.Cmd {
 	return emit(activateMsg{key: k8s.Key{Context: n.context, GVR: n.res.GVR(), Namespace: ns}, res: n.res})
 }
 
+// pinFor returns what pinning n means: its namespace, or its cluster when n
+// is not inside a namespace.
+func pinFor(n *navNode) config.Pin {
+	for ; n != nil; n = n.parent {
+		switch n.kind {
+		case nkNamespace:
+			return config.Pin{Context: n.context, Namespace: n.ns}
+		case nkContext:
+			return config.Pin{Context: n.context}
+		}
+	}
+	return config.Pin{}
+}
+
 func (v *navView) Update(msg tea.Msg) tea.Cmd {
 	if len(v.lines) == 0 {
 		return nil
@@ -233,6 +249,10 @@ func (v *navView) Update(msg tea.Msg) tea.Cmd {
 		switch msg.String() {
 		case "enter", "space":
 			return v.activate(n)
+		case "p":
+			if pin := pinFor(n); pin.Context != "" {
+				return emit(togglePinMsg{pin})
+			}
 		case "right", "l":
 			if n.foldable() && !n.expanded {
 				return v.toggle(n)
@@ -302,11 +322,18 @@ func (v *navView) renderLine(n *navNode, selected bool, w int) string {
 			glyph = "▾ "
 		}
 	}
-	label, suffix := n.label, ""
+	label, suffix, star := n.label, "", ""
 	isActive := false
 	switch n.kind {
 	case nkContext:
 		label = "⎈ " + label
+		if v.pinned != nil && v.pinned(config.Pin{Context: n.context}) {
+			star = " ★"
+		}
+	case nkNamespace:
+		if v.pinned != nil && v.pinned(config.Pin{Context: n.context, Namespace: n.ns}) {
+			star = " ★"
+		}
 	case nkResource:
 		key := k8s.Key{Context: n.context, GVR: n.res.GVR(), Namespace: n.ns}
 		if !n.res.Namespaced {
@@ -323,7 +350,7 @@ func (v *navView) renderLine(n *navNode, selected bool, w int) string {
 		if v.focused {
 			st = stSel
 		}
-		return st.Render(fit(indent+glyph+label+suffix, w))
+		return st.Render(fit(indent+glyph+label+star+suffix, w))
 	}
 	var ls string
 	switch {
@@ -340,5 +367,5 @@ func (v *navView) renderLine(n *navNode, selected bool, w int) string {
 	default:
 		ls = label
 	}
-	return indent + stMuted.Render(glyph) + ls + stMuted.Render(suffix)
+	return indent + stMuted.Render(glyph) + ls + stAccent.Render(star) + stMuted.Render(suffix)
 }
