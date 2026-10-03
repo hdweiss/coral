@@ -7,7 +7,7 @@ Handoff notes for picking the work back up. Last updated 2026-10-03 (second sess
 A first working version of coralctl in Go with Bubble Tea v2 (`charm.land/bubbletea/v2`), Lip Gloss v2 and Bubbles v2. k9s is the template for features and UX only. Its code is built on tview, so none of it is reused.
 
 ```
-cmd/coralctl/main.go      cobra root (TUI) + `version`; flags --demo --context -n -A --refresh --timeout --theme
+cmd/coral/main.go         cobra root (TUI) + `version`; flags --demo --context -n -A --refresh --timeout --theme
 internal/k8s/             data layer
   resources.go            built-in resource registry: aliases, GVR, nav category
   columns.go              per-kind table columns (pods, deploy, svc, …) + generic fallback
@@ -39,7 +39,7 @@ internal/ui/              TUI
   styles.go, input.go     colors, frame drawing, shared helpers
 ```
 
-Run it with `make demo` (`make build`, `make test`, `make check` and `make install` also exist). There is no real cluster in the dev environment, so test with `--demo`. tmux is installed; `tmux new -d -s coral -x 160 -y 40 ./bin/coralctl --demo` plus `tmux capture-pane -p` works for checking the screen.
+Run it with `make demo` (`make build`, `make test`, `make check` and `make install` also exist). There is no real cluster in the dev environment, so test with `--demo`. tmux is installed; `tmux new -d -s coral -x 160 -y 40 ./bin/coral --demo` plus `tmux capture-pane -p` works for checking the screen.
 
 Tests: `go test ./...` (demo store lists every builtin; events and warning counts; relations on the demo cluster; yamltree ordering and folding; table column layout).
 
@@ -59,7 +59,7 @@ Mouse can be scripted in tmux by sending SGR sequences as literal keys, for exam
 - Double-click is detected in `App.handleMouse` (400ms, same cell).
 - Below 100 columns the detail panel replaces the table instead of sitting next to it.
 - **Column fitting** (`layoutColumns` in table.go): NAME shrinks to 24, then columns with `Column.Drop > 0` are hidden (highest first: pods IP then NODE, svc CLUSTER-IP, pvc VOLUME/STORAGECLASS, …). Then NAME shrinks to 12, and finally columns are hidden from the right. NAME and the sort column are never hidden. `s` skips hidden columns.
-- **Pins** are `config.Pin{Context, Namespace, Resource}`: Namespace "" means the whole cluster, and Resource (a `k8s.Resource` name like `pods`) pins one list (a namespaced Resource without Namespace is the all-namespaces list). They are stored in `os.UserConfigDir()/coralctl/pins.json`, or `pins-demo.json` with `--demo`, and saved on every change. Ways to pin:
+- **Pins** are `config.Pin{Context, Namespace, Resource}`: Namespace "" means the whole cluster, and Resource (a `k8s.Resource` name like `pods`) pins one list (a namespaced Resource without Namespace is the all-namespaces list). They are stored in `os.UserConfigDir()/coral/pins.json`, or `pins-demo.json` with `--demo`, and saved on every change. Ways to pin:
   - `ctrl+p` in the navigator pins the resource list under the cursor, otherwise the node's namespace, or its cluster outside a namespace. On a pin, `ctrl+p`/delete/backspace unpins it. `ctrl+p` in the table pins where you are, like the header ☆.
   - Click the ☆/★ after the breadcrumb.
   - `:pin` pins the current namespace, or the cluster when the view is all-namespaces or cluster-scoped.
@@ -105,7 +105,6 @@ Mouse can be scripted in tmux by sending SGR sequences as literal keys, for exam
 
 - Verified in tmux this session: row click/double-click, header click sort, wheel, both divider drags (with clamping), nav click, detail fold click (glyph, or a second click on the selected line), breadcrumb → palette, palette filtering + `:ns`, `/` filter (Enter keeps, Esc clears), help overlay, narrow layout, pins (fold out, × unpin, cluster pins sorting first). Not checked in a real terminal emulator, only in tmux.
 - Small nit: `/` while the detail panel has focus leaves focus there, so the status bar shows detail keys while filtering the table.
-- Module path `github.com/hdweiss/coralctl` is a guess; change it if the repo lives elsewhere.
 
 ## Next up
 

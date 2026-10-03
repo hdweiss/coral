@@ -7,7 +7,7 @@ import (
 	"charm.land/bubbles/v2/textinput"
 	"charm.land/lipgloss/v2"
 	"github.com/charmbracelet/x/ansi"
-	"github.com/hdweiss/coralctl/internal/theme"
+	"github.com/hdweiss/coral/internal/theme"
 )
 
 // Colors and styles of the UI, set by applyTheme.

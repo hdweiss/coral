@@ -9,7 +9,7 @@ import (
 	tea "charm.land/bubbletea/v2"
 	"charm.land/lipgloss/v2"
 	"github.com/charmbracelet/x/ansi"
-	"github.com/hdweiss/coralctl/internal/k8s"
+	"github.com/hdweiss/coral/internal/k8s"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 )
 

@@ -20,7 +20,7 @@ import (
 )
 
 // demoProvider serves in-memory fake clusters, for development without a
-// real cluster (coralctl --demo).
+// real cluster (coral --demo).
 type demoProvider struct {
 	clients map[string]dynamic.Interface
 }

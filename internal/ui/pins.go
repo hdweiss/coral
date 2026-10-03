@@ -1,8 +1,8 @@
 package ui
 
 import (
-	"github.com/hdweiss/coralctl/internal/config"
-	"github.com/hdweiss/coralctl/internal/k8s"
+	"github.com/hdweiss/coral/internal/config"
+	"github.com/hdweiss/coral/internal/k8s"
 )
 
 // Messages for pinning, emitted by the navigator.

@@ -8,9 +8,9 @@ import (
 	tea "charm.land/bubbletea/v2"
 	"charm.land/lipgloss/v2"
 	"github.com/charmbracelet/x/ansi"
-	"github.com/hdweiss/coralctl/internal/edit"
-	"github.com/hdweiss/coralctl/internal/schema"
-	"github.com/hdweiss/coralctl/internal/yamltree"
+	"github.com/hdweiss/coral/internal/edit"
+	"github.com/hdweiss/coral/internal/schema"
+	"github.com/hdweiss/coral/internal/yamltree"
 )
 
 // picker is the "add field" dialog. The user types a dotted path below the

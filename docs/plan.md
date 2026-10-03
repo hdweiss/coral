@@ -75,7 +75,7 @@ From the brainstorm and earlier sessions; these are what set coral apart from k9
 - **`R` refresh dialog.** Meaning still to define (refresh interval, timeout, which lists).
 - **Light themes.** Auto-detect the terminal background (`tea.BackgroundColorMsg`) for the built-in palette.
 - **Links.** Open a pod's log URL from an annotation, open ingresses and services in the browser (reuse `openURL`).
-- **Subcommands.** Non-TUI subcommands (the brainstorm mentions them), e.g. `coralctl get` with the same columns.
+- **Subcommands.** Non-TUI subcommands (the brainstorm mentions them), e.g. `coral get` with the same columns.
 
 ## Open questions
 

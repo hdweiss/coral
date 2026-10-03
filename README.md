@@ -26,24 +26,24 @@ Or download an archive for your platform from the [releases page](https://github
 From source (requires Go 1.26+):
 
 ```sh
-make install        # or: go install ./cmd/coralctl
+make install        # or: go install ./cmd/coral
 ```
 
 ## Usage
 
 ```sh
-coralctl                       # current kubeconfig context
-coralctl --context prod -n web # start in a context and namespace
-coralctl -A                    # all namespaces
-coralctl --demo                # fake clusters
+coral                       # current kubeconfig context
+coral --context prod -n web # start in a context and namespace
+coral -A                    # all namespaces
+coral --demo                # fake clusters
 ```
 
-Other flags: `--kubeconfig`, `--refresh`, `--timeout` and `--theme` (or `$CORALCTL_THEME`). Run `coralctl --help` for details, and press `?` in the app for key bindings.
+Other flags: `--kubeconfig`, `--refresh`, `--timeout` and `--theme` (or `$CORALCTL_THEME`). Run `coral --help` for details, and press `?` in the app for key bindings.
 
 ## Development
 
 ```sh
-make build   # bin/coralctl
+make build   # bin/coral
 make demo    # build and run with demo clusters
 make test
 make check   # gofmt, go vet and tests

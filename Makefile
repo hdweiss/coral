@@ -1,4 +1,4 @@
-BIN     := bin/coralctl
+BIN     := bin/coral
 VERSION ?= $(shell git describe --tags --always --dirty 2>/dev/null || echo dev)
 LDFLAGS := -s -w -X main.version=$(VERSION)
 
@@ -7,7 +7,7 @@ LDFLAGS := -s -w -X main.version=$(VERSION)
 all: build
 
 build:
-	go build -ldflags '$(LDFLAGS)' -o $(BIN) ./cmd/coralctl
+	go build -ldflags '$(LDFLAGS)' -o $(BIN) ./cmd/coral
 
 ## run: build and start against the current kubeconfig
 run: build
@@ -33,7 +33,7 @@ check:
 	go test ./...
 
 install:
-	go install -ldflags '$(LDFLAGS)' ./cmd/coralctl
+	go install -ldflags '$(LDFLAGS)' ./cmd/coral
 
 clean:
 	rm -rf bin

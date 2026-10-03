@@ -1,4 +1,4 @@
-module github.com/hdweiss/coralctl
+module github.com/hdweiss/coral
 
 go 1.26.8
 

@@ -10,14 +10,14 @@ import (
 	"path/filepath"
 )
 
-// Path returns the path of a file in coralctl's config directory, or "" if
+// Path returns the path of a file in coral's config directory, or "" if
 // there is none.
 func Path(name string) string {
 	dir, err := os.UserConfigDir()
 	if err != nil {
 		return ""
 	}
-	return filepath.Join(dir, "coralctl", name)
+	return filepath.Join(dir, "coral", name)
 }
 
 // load decodes the JSON file at path into v. A missing file or empty path

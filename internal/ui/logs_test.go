@@ -5,9 +5,9 @@ import (
 	"slices"
 	"testing"
 
-	"github.com/hdweiss/coralctl/internal/config"
-	"github.com/hdweiss/coralctl/internal/k8s"
-	"github.com/hdweiss/coralctl/internal/logs"
+	"github.com/hdweiss/coral/internal/config"
+	"github.com/hdweiss/coral/internal/k8s"
+	"github.com/hdweiss/coral/internal/logs"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 )

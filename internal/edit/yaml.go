@@ -8,8 +8,8 @@ import (
 	"strconv"
 	"strings"
 
-	"github.com/hdweiss/coralctl/internal/schema"
-	"github.com/hdweiss/coralctl/internal/yamltree"
+	"github.com/hdweiss/coral/internal/schema"
+	"github.com/hdweiss/coral/internal/yamltree"
 	"go.yaml.in/yaml/v3"
 )
 

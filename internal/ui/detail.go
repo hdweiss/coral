@@ -8,9 +8,9 @@ import (
 	tea "charm.land/bubbletea/v2"
 	"charm.land/lipgloss/v2"
 	"github.com/charmbracelet/x/ansi"
-	"github.com/hdweiss/coralctl/internal/config"
-	"github.com/hdweiss/coralctl/internal/logs"
-	"github.com/hdweiss/coralctl/internal/yamltree"
+	"github.com/hdweiss/coral/internal/config"
+	"github.com/hdweiss/coral/internal/logs"
+	"github.com/hdweiss/coral/internal/yamltree"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 )
 

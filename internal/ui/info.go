@@ -11,8 +11,8 @@ import (
 
 	"charm.land/lipgloss/v2"
 	"github.com/charmbracelet/x/ansi"
-	"github.com/hdweiss/coralctl/internal/schema"
-	"github.com/hdweiss/coralctl/internal/yamltree"
+	"github.com/hdweiss/coral/internal/schema"
+	"github.com/hdweiss/coral/internal/yamltree"
 )
 
 // The info popup ("i" in the details) shows the schema help of the selected

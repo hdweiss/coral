@@ -4,7 +4,7 @@ import (
 	"slices"
 	"testing"
 
-	"github.com/hdweiss/coralctl/internal/k8s"
+	"github.com/hdweiss/coral/internal/k8s"
 )
 
 func TestLayoutColumns(t *testing.T) {

@@ -4,8 +4,8 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/hdweiss/coralctl/internal/schema"
-	"github.com/hdweiss/coralctl/internal/yamltree"
+	"github.com/hdweiss/coral/internal/schema"
+	"github.com/hdweiss/coral/internal/yamltree"
 	k8sschema "k8s.io/apimachinery/pkg/runtime/schema"
 )
 

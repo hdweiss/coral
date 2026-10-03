@@ -1,4 +1,4 @@
-// Command coralctl is a mouse-first Kubernetes TUI.
+// Command coral is a mouse-first Kubernetes TUI.
 package main
 
 import (
@@ -10,10 +10,10 @@ import (
 	"time"
 
 	tea "charm.land/bubbletea/v2"
-	"github.com/hdweiss/coralctl/internal/config"
-	"github.com/hdweiss/coralctl/internal/k8s"
-	"github.com/hdweiss/coralctl/internal/theme"
-	"github.com/hdweiss/coralctl/internal/ui"
+	"github.com/hdweiss/coral/internal/config"
+	"github.com/hdweiss/coral/internal/k8s"
+	"github.com/hdweiss/coral/internal/theme"
+	"github.com/hdweiss/coral/internal/ui"
 	"github.com/spf13/cobra"
 	"k8s.io/klog/v2"
 )
@@ -35,7 +35,7 @@ func rootCmd() *cobra.Command {
 		themeSpec  string
 	)
 	cmd := &cobra.Command{
-		Use:           "coralctl",
+		Use:           "coral",
 		Short:         "A mouse-first Kubernetes TUI with tree views",
 		SilenceUsage:  true,
 		SilenceErrors: false,
@@ -79,7 +79,7 @@ func rootCmd() *cobra.Command {
 	cmd.AddCommand(&cobra.Command{
 		Use:   "version",
 		Short: "Print the version",
-		Run:   func(cmd *cobra.Command, args []string) { fmt.Println("coralctl", version) },
+		Run:   func(cmd *cobra.Command, args []string) { fmt.Println("coral", version) },
 	})
 	return cmd
 }

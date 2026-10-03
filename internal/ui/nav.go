@@ -6,8 +6,8 @@ import (
 
 	tea "charm.land/bubbletea/v2"
 	"github.com/charmbracelet/x/ansi"
-	"github.com/hdweiss/coralctl/internal/config"
-	"github.com/hdweiss/coralctl/internal/k8s"
+	"github.com/hdweiss/coral/internal/config"
+	"github.com/hdweiss/coral/internal/k8s"
 )
 
 type navKind int

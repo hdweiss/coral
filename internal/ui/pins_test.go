@@ -4,8 +4,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/hdweiss/coralctl/internal/config"
-	"github.com/hdweiss/coralctl/internal/k8s"
+	"github.com/hdweiss/coral/internal/config"
+	"github.com/hdweiss/coral/internal/k8s"
 )
 
 func newTestNav(t *testing.T) *navView {

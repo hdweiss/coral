@@ -6,10 +6,10 @@ import (
 	"strings"
 
 	tea "charm.land/bubbletea/v2"
-	"github.com/hdweiss/coralctl/internal/edit"
-	"github.com/hdweiss/coralctl/internal/k8s"
-	"github.com/hdweiss/coralctl/internal/schema"
-	"github.com/hdweiss/coralctl/internal/yamltree"
+	"github.com/hdweiss/coral/internal/edit"
+	"github.com/hdweiss/coral/internal/k8s"
+	"github.com/hdweiss/coral/internal/schema"
+	"github.com/hdweiss/coral/internal/yamltree"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 )
 
