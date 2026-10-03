@@ -52,6 +52,25 @@ var Builtin = map[string]Theme{
 		Purple:  "#B48EAD",
 		Orange:  "#D08770",
 	},
+	// Catppuccin Mocha as Omarchy ships it (themes/catppuccin/colors.toml,
+	// whose neovim.lua selects catppuccin-mocha), mapped like ParseOmarchy.
+	"catppuccin": {
+		Accent:  "#89b4fa",
+		Fg:      "#cdd6f4",
+		Muted:   "#6c7086",
+		Border:  "#45475a",
+		SelBg:   "#45475a",
+		SelBgLo: "#313244",
+		BarBg:   "#161622",
+		LogoFg:  "#1e1e2e",
+		Green:   "#a6e3a1",
+		Yellow:  "#f9e2af",
+		Red:     "#f38ba8",
+		Blue:    "#89b4fa",
+		Cyan:    "#94e2d5",
+		Purple:  "#f5c2e7",
+		Orange:  "#f6b6ab",
+	},
 	// Kanagawa Wave, after https://github.com/rebelot/kanagawa.nvim.
 	"kanagawa": {
 		Accent:  "#7E9CD8", // crystalBlue

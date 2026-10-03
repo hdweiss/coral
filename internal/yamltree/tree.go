@@ -41,9 +41,24 @@ type Node struct {
 }
 
 // Build creates the tree for obj. The returned root is not itself displayed.
-func Build(obj map[string]any) *Node {
+func Build(obj map[string]any) *Node { return BuildFirst(obj) }
+
+// BuildFirst is Build with the given top-level keys first, in that order,
+// before the usual ordering.
+func BuildFirst(obj map[string]any, first ...string) *Node {
 	root := &Node{Kind: Map, Index: -1, Depth: -1, Expanded: true}
-	for _, k := range orderedKeys("", obj) {
+	keys := orderedKeys("", obj)
+	slices.SortStableFunc(keys, func(a, b string) int {
+		ra, rb := slices.Index(first, a), slices.Index(first, b)
+		if ra < 0 {
+			ra = len(first)
+		}
+		if rb < 0 {
+			rb = len(first)
+		}
+		return ra - rb
+	})
+	for _, k := range keys {
 		root.Children = append(root.Children, newNode(root, k, -1, obj[k]))
 	}
 	return root
@@ -102,7 +117,8 @@ func defaultExpanded(n *Node) bool {
 
 // Preferred key order per path; other keys follow alphabetically.
 var keyOrder = map[string][]string{
-	"":          {"apiVersion", "kind", "metadata", "spec", "type", "data", "stringData", "binaryData", "status"},
+	// reason and message lead in events, after type.
+	"":          {"apiVersion", "kind", "metadata", "spec", "type", "reason", "message", "data", "stringData", "binaryData", "status"},
 	".metadata": {"name", "generateName", "namespace", "uid", "resourceVersion", "generation", "creationTimestamp", "deletionTimestamp", "labels", "annotations", "ownerReferences", "finalizers", "managedFields"},
 }
 
@@ -311,4 +327,101 @@ func (n *Node) Hint() string {
 		}
 	}
 	return ""
+}
+
+// ParsePattern splits a Pattern (or Path) into segments. List steps get
+// Index -1 for "[]" (any item) or their number.
+func ParsePattern(p string) ([]Seg, bool) {
+	var segs []Seg
+	for p != "" {
+		switch {
+		case p[0] == '.':
+			end := strings.IndexAny(p[1:], ".[")
+			if end < 0 {
+				end = len(p) - 1
+			}
+			segs = append(segs, Seg{Key: p[1 : end+1], Index: -1})
+			p = p[end+1:]
+		case strings.HasPrefix(p, "[]"):
+			segs = append(segs, Seg{Index: -2})
+			p = p[2:]
+		case strings.HasPrefix(p, `["`):
+			q, err := strconv.QuotedPrefix(p[1:])
+			if err != nil || !strings.HasPrefix(p[1+len(q):], "]") {
+				return nil, false
+			}
+			key, _ := strconv.Unquote(q)
+			segs = append(segs, Seg{Key: key, Index: -1})
+			p = p[1+len(q)+1:]
+		case p[0] == '[':
+			end := strings.IndexByte(p, ']')
+			i, err := strconv.Atoi(p[1:max(end, 1)])
+			if end < 0 || err != nil {
+				return nil, false
+			}
+			segs = append(segs, Seg{Index: i})
+			p = p[end+1:]
+		default:
+			return nil, false
+		}
+	}
+	return segs, true
+}
+
+// Lookup returns the value at pattern in obj. A "[]" step takes the first
+// list item that has the rest of the path.
+func Lookup(obj any, pattern string) (any, bool) {
+	segs, ok := ParsePattern(pattern)
+	if !ok {
+		return nil, false
+	}
+	return lookup(obj, segs)
+}
+
+func lookup(v any, segs []Seg) (any, bool) {
+	if len(segs) == 0 {
+		return v, true
+	}
+	s := segs[0]
+	switch {
+	case s.Index == -1:
+		m, ok := v.(map[string]any)
+		if !ok {
+			return nil, false
+		}
+		c, ok := m[s.Key]
+		if !ok {
+			return nil, false
+		}
+		return lookup(c, segs[1:])
+	case s.Index == -2:
+		l, _ := v.([]any)
+		for _, c := range l {
+			if r, ok := lookup(c, segs[1:]); ok {
+				return r, true
+			}
+		}
+	default:
+		l, _ := v.([]any)
+		if s.Index < len(l) {
+			return lookup(l[s.Index], segs[1:])
+		}
+	}
+	return nil, false
+}
+
+// PatternLabel is a pattern as a dotted key path without list steps, such as
+// service.name, for short labels.
+func PatternLabel(pattern string) string {
+	segs, ok := ParsePattern(pattern)
+	if !ok {
+		return pattern
+	}
+	var keys []string
+	for _, s := range segs {
+		if s.Index == -1 {
+			keys = append(keys, s.Key)
+		}
+	}
+	return strings.Join(keys, ".")
 }

@@ -36,6 +36,9 @@ const (
 	CatStorage   = "Storage"
 	CatAccess    = "Access Control"
 	CatCluster   = "Cluster"
+	// CatTop resources sit directly under a namespace in the navigator,
+	// after the categories.
+	CatTop = ""
 )
 
 // NamespacedCategories is the order categories appear under a namespace.
@@ -59,6 +62,8 @@ var Builtins = []Resource{
 	{"secrets", "Secret", "Secrets", "", "v1", true, CatConfig, []string{"sec", "secret"}},
 
 	{"persistentvolumeclaims", "PersistentVolumeClaim", "PVCs", "", "v1", true, CatStorage, []string{"pvc"}},
+
+	{"events", "Event", "Events", "", "v1", true, CatTop, []string{"ev", "event"}},
 
 	{"serviceaccounts", "ServiceAccount", "ServiceAccounts", "", "v1", true, CatAccess, []string{"sa"}},
 	{"roles", "Role", "Roles", "rbac.authorization.k8s.io", "v1", true, CatAccess, []string{"role"}},

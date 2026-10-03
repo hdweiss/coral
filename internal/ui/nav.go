@@ -5,6 +5,7 @@ import (
 	"strings"
 
 	tea "charm.land/bubbletea/v2"
+	"github.com/charmbracelet/x/ansi"
 	"github.com/hdweiss/coralctl/internal/config"
 	"github.com/hdweiss/coralctl/internal/k8s"
 )
@@ -18,6 +19,7 @@ const (
 	nkCategory
 	nkResource
 	nkInfo // non-interactive message, e.g. "loading…"
+	nkPins // the "Pinned" section header
 )
 
 type navNode struct {
@@ -31,6 +33,7 @@ type navNode struct {
 	parent   *navNode
 	expanded bool
 	depth    int
+	pin      *config.Pin // set on the top node of a pin
 }
 
 func (n *navNode) add(c *navNode) *navNode {
@@ -63,12 +66,21 @@ type navView struct {
 	active  k8s.Key
 	loaded  map[string]bool // contexts whose namespaces arrived
 	pending *activateMsg    // reveal once namespaces load
-	pinned  func(config.Pin) bool
+
+	contexts []string // kubeconfig order; pinned clusters move to the front
+	pins     []config.Pin
+	pinned   *navNode              // the "Pinned" section, shown above the contexts
+	known    func(ctx string) bool // whether a context exists in the kubeconfig
 }
 
 func newNavView(store *k8s.Store) *navView {
-	v := &navView{store: store, loaded: map[string]bool{}}
-	for _, ctx := range store.Provider().Contexts() {
+	v := &navView{
+		store:    store,
+		loaded:   map[string]bool{},
+		contexts: store.Provider().Contexts(),
+		pinned:   &navNode{kind: nkPins, label: "Pinned", expanded: true},
+	}
+	for _, ctx := range v.contexts {
 		v.roots = append(v.roots, newContextNode(ctx))
 	}
 	v.refresh()
@@ -77,13 +89,18 @@ func newNavView(store *k8s.Store) *navView {
 
 func newContextNode(ctx string) *navNode {
 	n := &navNode{kind: nkContext, label: ctx, context: ctx}
+	fillContext(n)
+	return n
+}
+
+// fillContext adds the children of a context node.
+func fillContext(n *navNode) {
 	cluster := n.add(&navNode{kind: nkCategory, label: k8s.CatCluster})
 	for _, r := range k8s.InCategory(k8s.CatCluster) {
 		cluster.add(&navNode{kind: nkResource, label: r.Title, res: r})
 	}
 	addCategories(n.add(&navNode{kind: nkAllNS, label: "All namespaces"}))
 	n.add(&navNode{kind: nkInfo, label: "loading namespaces…"})
-	return n
 }
 
 func addCategories(n *navNode) {
@@ -93,6 +110,9 @@ func addCategories(n *navNode) {
 			c.add(&navNode{kind: nkResource, label: r.Title, res: r, ns: n.ns})
 		}
 		c.expanded = cat == k8s.CatWorkloads
+	}
+	for _, r := range k8s.InCategory(k8s.CatTop) {
+		n.add(&navNode{kind: nkResource, label: r.Title, res: r, ns: n.ns})
 	}
 }
 
@@ -111,6 +131,16 @@ func (v *navView) SetNamespaces(ctx string, names []string, err error) {
 	if root == nil {
 		return
 	}
+	setNamespaces(root, names, err)
+	v.loaded[ctx] = true
+	if p := v.pending; p != nil && p.key.Context == ctx {
+		v.pending = nil
+		v.Reveal(p.key, p.res)
+	}
+	v.refresh()
+}
+
+func setNamespaces(root *navNode, names []string, err error) {
 	old := map[string]*navNode{}
 	var kept []*navNode
 	for _, c := range root.children {
@@ -134,15 +164,12 @@ func (v *navView) SetNamespaces(ctx string, names []string, err error) {
 		n := root.add(&navNode{kind: nkNamespace, label: ns, ns: ns})
 		addCategories(n)
 	}
-	v.loaded[ctx] = true
-	if p := v.pending; p != nil && p.key.Context == ctx {
-		v.pending = nil
-		v.Reveal(p.key, p.res)
-	}
-	v.refresh()
 }
 
-// Reveal expands the path to the node for key and moves the cursor there.
+// Reveal expands the path to the node for key and moves the cursor there. It
+// looks at the cursor and the pin the cursor is in first, so that opening
+// something inside a pin stays there, then in namespace and resource pins,
+// then in the context's tree.
 func (v *navView) Reveal(key k8s.Key, res k8s.Resource) {
 	v.active = key
 	root := v.root(key.Context)
@@ -155,13 +182,27 @@ func (v *navView) Reveal(key k8s.Key, res k8s.Resource) {
 		if target != nil {
 			return
 		}
-		if n.kind == nkResource && n.res.Name == res.Name && (n.ns == key.Namespace || !res.Namespaced) {
+		if n.kind == nkResource && n.context == key.Context && n.res.Name == res.Name && (n.ns == key.Namespace || !res.Namespaced) {
 			target = n
 			return
 		}
 		for _, c := range n.children {
 			find(c)
 		}
+	}
+	if v.cursor < len(v.lines) {
+		c := v.lines[v.cursor]
+		if c.kind == nkResource {
+			find(c)
+		}
+		for ; c != nil; c = c.parent {
+			if c.pin != nil {
+				find(c)
+			}
+		}
+	}
+	for _, p := range v.pinned.children {
+		find(p)
 	}
 	find(root)
 	if target == nil {
@@ -195,6 +236,9 @@ func (v *navView) refresh() {
 			}
 		}
 	}
+	if len(v.pinned.children) > 0 {
+		walk([]*navNode{v.pinned})
+	}
 	walk(v.roots)
 	v.cursor = clamp(v.cursor, 0, len(v.lines)-1)
 }
@@ -214,7 +258,16 @@ func (v *navView) toggle(n *navNode) tea.Cmd {
 	return nil
 }
 
+// isPinFolder reports whether n is a namespace pin, which opens like the old
+// location (keeping the resource type) besides folding.
+func isPinFolder(n *navNode) bool {
+	return n.pin != nil && n.kind == nkNamespace
+}
+
 func (v *navView) activate(n *navNode) tea.Cmd {
+	if isPinFolder(n) {
+		return emit(openPinMsg{*n.pin})
+	}
 	if n.kind != nkResource {
 		return v.toggle(n)
 	}
@@ -223,20 +276,6 @@ func (v *navView) activate(n *navNode) tea.Cmd {
 		ns = ""
 	}
 	return emit(activateMsg{key: k8s.Key{Context: n.context, GVR: n.res.GVR(), Namespace: ns}, res: n.res})
-}
-
-// pinFor returns what pinning n means: its namespace, or its cluster when n
-// is not inside a namespace.
-func pinFor(n *navNode) config.Pin {
-	for ; n != nil; n = n.parent {
-		switch n.kind {
-		case nkNamespace:
-			return config.Pin{Context: n.context, Namespace: n.ns}
-		case nkContext:
-			return config.Pin{Context: n.context}
-		}
-	}
-	return config.Pin{}
 }
 
 func (v *navView) Update(msg tea.Msg) tea.Cmd {
@@ -248,10 +287,18 @@ func (v *navView) Update(msg tea.Msg) tea.Cmd {
 		n := v.lines[v.cursor]
 		switch msg.String() {
 		case "enter", "space":
+			if n.kind == nkResource {
+				// Moving onto it already shows the list; enter goes there.
+				return tea.Sequence(v.activate(n), emit(focusMsg{focusTable}))
+			}
 			return v.activate(n)
-		case "p":
+		case "ctrl+p":
 			if pin := pinFor(n); pin.Context != "" {
 				return emit(togglePinMsg{pin})
+			}
+		case "delete", "backspace":
+			if n.pin != nil {
+				return emit(togglePinMsg{*n.pin})
 			}
 		case "right", "l":
 			if n.foldable() && !n.expanded {
@@ -259,6 +306,8 @@ func (v *navView) Update(msg tea.Msg) tea.Cmd {
 			}
 			if n.expanded && len(n.children) > 0 {
 				v.cursor++
+			} else if n.kind == nkResource {
+				return emit(focusMsg{focusTable}) // a leaf: move on to its list
 			}
 		case "left", "h":
 			if n.foldable() && n.expanded {
@@ -291,6 +340,12 @@ func (v *navView) Update(msg tea.Msg) tea.Cmd {
 		was := v.cursor
 		v.cursor = i
 		switch {
+		case n.pin != nil && msg.x >= v.rect.w-2-ansi.StringWidth(unpinGlyph):
+			return emit(togglePinMsg{*n.pin})
+		case isPinFolder(n) && !onGlyph && !msg.double && was != i:
+			return v.activate(n)
+		case n.kind == nkResource && msg.double:
+			return tea.Sequence(v.activate(n), emit(focusMsg{focusTable}))
 		case n.kind == nkResource:
 			return v.activate(n)
 		case onGlyph || msg.double || was == i:
@@ -322,18 +377,31 @@ func (v *navView) renderLine(n *navNode, selected bool, w int) string {
 			glyph = "▾ "
 		}
 	}
-	label, suffix, star := n.label, "", ""
+	label, loc, suffix, star := n.label, "", "", ""
 	isActive := false
+	if n.pin != nil {
+		// Pins name their location after the label, since they sit outside
+		// its tree and the label matters most when the line is cut.
+		switch {
+		case n.kind == nkResource && n.res.Namespaced && n.ns == "":
+			loc = " · " + n.context + " › all"
+		case n.kind == nkResource && n.ns != "":
+			loc = " · " + n.context + " › " + n.ns
+		case n.kind == nkResource, n.kind == nkNamespace:
+			loc = " · " + n.context
+		}
+		isActive = v.pinActive(n)
+	} else if (n.kind == nkContext || n.kind == nkNamespace || n.kind == nkResource) && v.hasPin(pinFor(n)) {
+		star = " ★"
+		if n.kind == nkContext { // pinned clusters show their number key
+			star += v.pinNumber(pinFor(n))
+		}
+	}
 	switch n.kind {
 	case nkContext:
 		label = "⎈ " + label
-		if v.pinned != nil && v.pinned(config.Pin{Context: n.context}) {
-			star = " ★"
-		}
-	case nkNamespace:
-		if v.pinned != nil && v.pinned(config.Pin{Context: n.context, Namespace: n.ns}) {
-			star = " ★"
-		}
+	case nkPins:
+		label = "★ " + label
 	case nkResource:
 		key := k8s.Key{Context: n.context, GVR: n.res.GVR(), Namespace: n.ns}
 		if !n.res.Namespaced {
@@ -344,13 +412,20 @@ func (v *navView) renderLine(n *navNode, selected bool, w int) string {
 		}
 		isActive = key == v.active
 	}
+	// Pins end in a × that unpins them.
+	// Pins end in their number key (1-9) and a × that unpins them.
+	unpin := ""
+	if n.pin != nil {
+		unpin = v.pinNumber(*n.pin) + unpinGlyph
+		w -= ansi.StringWidth(unpin)
+	}
 
 	if selected {
 		st := stSelLo
 		if v.focused {
 			st = stSel
 		}
-		return st.Render(fit(indent+glyph+label+star+suffix, w))
+		return st.Render(fit(indent+glyph+label+star+suffix+loc, w) + unpin)
 	}
 	var ls string
 	switch {
@@ -362,10 +437,18 @@ func (v *navView) renderLine(n *navNode, selected bool, w int) string {
 		ls = stAccent.Bold(true).Render(label)
 	case n.kind == nkContext:
 		ls = stBold.Render(label)
+	case n.kind == nkContext, n.kind == nkPins:
+		ls = stBold.Render(label)
 	case n.kind == nkCategory:
 		ls = stMuted.Render(label)
 	default:
 		ls = label
 	}
-	return indent + stMuted.Render(glyph) + ls + stAccent.Render(star) + stMuted.Render(suffix)
+	line := indent + stMuted.Render(glyph) + ls + stAccent.Render(star) + stMuted.Render(suffix) + stMuted.Render(loc)
+	if unpin != "" {
+		return fit(line, w) + stMuted.Render(unpin)
+	}
+	return line
 }
+
+const unpinGlyph = " × "

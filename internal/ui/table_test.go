@@ -49,3 +49,16 @@ func TestLayoutColumnsKeepsSortColumn(t *testing.T) {
 		t.Errorf("got %v", got)
 	}
 }
+
+func TestLayoutColumnsFlexTakesLeftover(t *testing.T) {
+	// Events: MESSAGE is the flex column; hiding OBJECT frees room for it.
+	cols := []k8s.Column{{Name: "LAST SEEN"}, {Name: "TYPE", Drop: 2}, {Name: "OBJECT"}, {Name: "MESSAGE", Flex: true}}
+	got := layoutColumns(cols, []int{10, 7, 40, 100}, 80, 0)
+	if !slices.Equal(got, []int{10, 0, 40, 25}) {
+		t.Errorf("got %v", got)
+	}
+	got = layoutColumns(cols, []int{10, 7, 40, 100}, 50, 0)
+	if !slices.Equal(got, []int{10, 0, 0, 37}) {
+		t.Errorf("narrow: got %v", got)
+	}
+}

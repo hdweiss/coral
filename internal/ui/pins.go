@@ -1,33 +1,23 @@
 package ui
 
 import (
-	tea "charm.land/bubbletea/v2"
-	"charm.land/lipgloss/v2"
-	"github.com/charmbracelet/x/ansi"
 	"github.com/hdweiss/coralctl/internal/config"
+	"github.com/hdweiss/coralctl/internal/k8s"
 )
 
-// Messages for pinning, emitted by the nav and pins panels.
+// Messages for pinning, emitted by the navigator.
 type (
 	togglePinMsg struct{ pin config.Pin }
 	openPinMsg   struct{ pin config.Pin }
 )
 
-// pinsView is the box of pinned clusters and namespaces above the navigator.
-type pinsView struct {
-	rect    rect
-	focused bool
+// Pinned clusters move to the front of the context list. Namespace and
+// resource pins are nodes of the "Pinned" section at the top of the
+// navigator: a namespace pin folds out like the namespace, and a resource pin
+// is a leaf that opens the list.
 
-	pins     []config.Pin
-	known    func(ctx string) bool // whether the context exists in the kubeconfig
-	cursor   int
-	offset   int
-	ctx, ns  string // the current location, highlighted when pinned
-	nsScoped bool   // whether the current view is namespaced
-}
-
-func (p *pinsView) has(pin config.Pin) bool {
-	for _, q := range p.pins {
+func (v *navView) hasPin(pin config.Pin) bool {
+	for _, q := range v.pins {
 		if q == pin {
 			return true
 		}
@@ -35,120 +25,159 @@ func (p *pinsView) has(pin config.Pin) bool {
 	return false
 }
 
-// toggle adds pin at the end, or removes it if it is already pinned. It
+// togglePin adds pin at the end, or removes it if it is already pinned. It
 // reports whether the pin is now present.
-func (p *pinsView) toggle(pin config.Pin) bool {
-	for i, q := range p.pins {
+func (v *navView) togglePin(pin config.Pin) bool {
+	pins := v.pins
+	added := true
+	for i, q := range pins {
 		if q == pin {
-			p.pins = append(p.pins[:i:i], p.pins[i+1:]...)
-			p.cursor = clamp(p.cursor, 0, len(p.pins)-1)
-			return false
+			pins = append(pins[:i:i], pins[i+1:]...)
+			added = false
+			break
 		}
 	}
-	p.pins = append(p.pins, pin)
-	return true
+	if added {
+		pins = append(pins, pin)
+	}
+	v.SetPins(pins)
+	return added
 }
 
-func (p *pinsView) height() int { return p.rect.h - 2 }
-
-// wantHeight is the box height that shows every pin.
-func (p *pinsView) wantHeight() int {
-	if len(p.pins) == 0 {
-		return 0
+// SetPins replaces the pinned section and reorders the contexts, keeping the
+// fold state of pins that stay.
+func (v *navView) SetPins(pins []config.Pin) {
+	var at *navNode
+	if v.cursor < len(v.lines) {
+		at = v.lines[v.cursor]
 	}
-	return len(p.pins) + 2
+	v.pins = pins
+	old := map[config.Pin]*navNode{}
+	for _, c := range v.pinned.children {
+		old[*c.pin] = c
+	}
+	v.pinned.children = nil
+	v.sortRoots()
+	for _, p := range pins {
+		if v.isClusterPin(p) {
+			continue
+		}
+		if n, ok := old[p]; ok {
+			v.pinned.children = append(v.pinned.children, n)
+			continue
+		}
+		v.addPin(p)
+	}
+	v.refresh()
+	for i, n := range v.lines {
+		if n == at {
+			v.cursor = i
+		}
+	}
 }
 
-func (p *pinsView) Update(msg tea.Msg) tea.Cmd {
-	if len(p.pins) == 0 {
-		return nil
+func (v *navView) addPin(p config.Pin) {
+	pin := p
+	n := v.pinned.add(&navNode{pin: &pin, ns: p.Namespace})
+	n.context = p.Context
+	switch {
+	case v.known != nil && !v.known(p.Context):
+		n.kind, n.err, n.label = nkInfo, true, p.Context+" (missing)"
+	case p.Resource != "":
+		res, ok := k8s.Lookup(p.Resource)
+		if !ok {
+			n.kind, n.err, n.label = nkInfo, true, p.Resource+" (unknown)"
+			return
+		}
+		n.kind, n.res, n.label = nkResource, res, res.Title
+	case p.Namespace != "":
+		n.kind, n.label = nkNamespace, p.Namespace
+		addCategories(n)
 	}
-	switch msg := msg.(type) {
-	case tea.KeyPressMsg:
-		pin := p.pins[p.cursor]
-		switch msg.String() {
-		case "enter", "space", "right", "l":
-			return emit(openPinMsg{pin})
-		case "p", "d", "x", "delete", "backspace":
-			return emit(togglePinMsg{pin})
-		default:
-			if c, ok := moveCursor(msg.String(), p.cursor, len(p.pins), p.height()); ok {
-				p.cursor = c
+}
+
+// isClusterPin reports whether p only reorders the contexts. A pinned
+// cluster missing from the kubeconfig stays in the section, to be removed.
+func (v *navView) isClusterPin(p config.Pin) bool {
+	return p.Namespace == "" && p.Resource == "" && (v.known == nil || v.known(p.Context))
+}
+
+// sortRoots puts pinned clusters first, in pin order, then the rest in
+// kubeconfig order.
+func (v *navView) sortRoots() {
+	byCtx := map[string]*navNode{}
+	for _, r := range v.roots {
+		byCtx[r.context] = r
+	}
+	v.roots = v.roots[:0]
+	for _, p := range v.pins {
+		if r := byCtx[p.Context]; r != nil && v.isClusterPin(p) {
+			v.roots = append(v.roots, r)
+			delete(byCtx, p.Context)
+		}
+	}
+	for _, ctx := range v.contexts {
+		if r := byCtx[ctx]; r != nil {
+			v.roots = append(v.roots, r)
+		}
+	}
+}
+
+// pinNumber is the key that opens pin, "1" to "9", or "" past nine.
+func (v *navView) pinNumber(pin config.Pin) string {
+	for i, q := range v.pins {
+		if q == pin && i < 9 {
+			return string(rune('1' + i))
+		}
+	}
+	return ""
+}
+
+// pinFor returns what pressing p on n means: the pin itself, the resource
+// list, or else the enclosing namespace or cluster.
+func pinFor(n *navNode) config.Pin {
+	if n.pin != nil {
+		return *n.pin
+	}
+	if n.kind == nkResource {
+		ns := n.ns
+		if !n.res.Namespaced {
+			ns = ""
+		}
+		return config.Pin{Context: n.context, Namespace: ns, Resource: n.res.Name}
+	}
+	for ; n != nil; n = n.parent {
+		switch n.kind {
+		case nkNamespace:
+			return config.Pin{Context: n.context, Namespace: n.ns}
+		case nkContext:
+			return config.Pin{Context: n.context}
+		}
+	}
+	return config.Pin{}
+}
+
+// pinLabel describes pin for messages.
+func pinLabel(pin config.Pin) string {
+	s := "⎈ " + pin.Context
+	if pin.Namespace != "" {
+		s = pin.Context + " › " + pin.Namespace
+	}
+	if pin.Resource != "" {
+		title := pin.Resource
+		if r, ok := k8s.Lookup(pin.Resource); ok {
+			title = r.Title
+			if r.Namespaced && pin.Namespace == "" {
+				s = pin.Context + " › all"
 			}
 		}
-	case clickMsg:
-		i := p.offset + msg.y
-		if i < 0 || i >= len(p.pins) {
-			return nil
-		}
-		p.cursor = i
-		if msg.x >= p.rect.w-2-len(" x ") { // the × at the right edge
-			return emit(togglePinMsg{p.pins[i]})
-		}
-		return emit(openPinMsg{p.pins[i]})
-	case wheelMsg:
-		p.offset = clamp(p.offset+msg.delta, 0, max(len(p.pins)-p.height(), 0))
-		return nil
+		s += " › " + title
 	}
-	p.offset = scrollTo(p.cursor, p.offset, p.height())
-	return nil
+	return s
 }
 
-// active reports whether pin is where the user currently is. A cluster pin
-// is active anywhere in its cluster unless a namespace pin matches better.
-func (p *pinsView) active(pin config.Pin) bool {
-	if pin.Context != p.ctx {
-		return false
-	}
-	if pin.Namespace != "" {
-		return p.nsScoped && pin.Namespace == p.ns
-	}
-	return !(p.nsScoped && p.has(config.Pin{Context: p.ctx, Namespace: p.ns}))
-}
-
-func (p *pinsView) View() string {
-	iw := p.rect.w - 2
-	lines := make([]string, 0, p.height())
-	for i := p.offset; i < len(p.pins) && len(lines) < p.height(); i++ {
-		lines = append(lines, p.renderLine(p.pins[i], i == p.cursor, iw))
-	}
-	return frame("Pinned", "", lines, p.rect.w, p.rect.h, p.focused)
-}
-
-func (p *pinsView) renderLine(pin config.Pin, selected bool, w int) string {
-	const unpin = " × "
-	lw := w - ansi.StringWidth(unpin)
-	missing := p.known != nil && !p.known(pin.Context)
-
-	if selected {
-		label := " ⎈ " + pin.Context
-		if pin.Namespace != "" {
-			label = " " + pin.Context + " › " + pin.Namespace
-		}
-		st := stSelLo
-		if p.focused {
-			st = stSel
-		}
-		return st.Render(fit(label, lw) + unpin)
-	}
-
-	var label string
-	switch {
-	case missing:
-		label = stErr.Render(" " + pin.Context + " (missing)")
-	case pin.Namespace == "":
-		st := stBold
-		if p.active(pin) {
-			st = stAccent.Bold(true)
-		}
-		label = " " + st.Render("⎈ "+pin.Context)
-	default:
-		st := stMuted
-		ns := lipgloss.NewStyle()
-		if p.active(pin) {
-			ns = stAccent.Bold(true)
-		}
-		label = " " + st.Render(pin.Context+" › ") + ns.Render(pin.Namespace)
-	}
-	return fit(label, lw) + stMuted.Render(unpin)
+// pinActive reports whether the namespace pin n is where the user currently
+// is.
+func (v *navView) pinActive(n *navNode) bool {
+	return n.kind == nkNamespace && n.context == v.active.Context && n.ns == v.active.Namespace
 }

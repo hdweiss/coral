@@ -9,6 +9,7 @@ import (
 	"charm.land/lipgloss/v2"
 	"github.com/charmbracelet/x/ansi"
 	"github.com/hdweiss/coralctl/internal/config"
+	"github.com/hdweiss/coralctl/internal/logs"
 	"github.com/hdweiss/coralctl/internal/yamltree"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 )
@@ -26,6 +27,11 @@ type detailView struct {
 
 	fields *config.Fields // favorite and hidden fields per kind
 	info   infoState      // the "i" help popup
+
+	// log is the log entry shown instead of an object while the log view is
+	// open; obj then wraps its fields. Favorites are the fields pinned to
+	// the log lines.
+	log *logs.Entry
 }
 
 // fieldsChangedMsg asks the app to save the field preferences.
@@ -33,6 +39,9 @@ type fieldsChangedMsg struct{}
 
 // kind is the key of the shown object's field preferences.
 func (d *detailView) kind() string {
+	if d.log != nil {
+		return logFieldsKind
+	}
 	return d.obj.GroupVersionKind().GroupKind().String()
 }
 
@@ -93,6 +102,9 @@ func (d *detailView) actions(n *yamltree.Node, selected bool) []rowAction {
 		if n.Favorite {
 			star = "★"
 		}
+		if d.log != nil {
+			star += " pin" // a favorite log field shows on every line
+		}
 		return []rowAction{
 			{star, func() tea.Cmd { return d.toggleFavorite(n) }},
 			{"hide", func() tea.Cmd { return d.toggleHidden(n) }},
@@ -112,6 +124,10 @@ func actionsWidth(acts []rowAction) int {
 // SetObject shows obj. When obj is the same object as before (e.g. after a
 // refresh), folding and cursor position are kept.
 func (d *detailView) SetObject(obj *unstructured.Unstructured) {
+	if d.log != nil {
+		d.log, d.obj = nil, nil
+		d.cursor, d.offset = 0, 0
+	}
 	if obj == d.obj {
 		return
 	}
@@ -144,6 +160,38 @@ func (d *detailView) SetObject(obj *unstructured.Unstructured) {
 	if cursorPath != "" {
 		d.moveTo(d.root.Find(cursorPath))
 	}
+}
+
+// SetLog shows a log entry. Folding and the cursor's field carry over from the
+// previous entry, so that moving through the log keeps the same field in view.
+func (d *detailView) SetLog(e *logs.Entry) {
+	if e == d.log && d.root != nil {
+		return
+	}
+	var state map[string]bool
+	cursorPath := ""
+	if d.log != nil && d.root != nil {
+		state = d.root.ExpansionState()
+		if c := d.current(); c != nil {
+			cursorPath = c.Path
+		}
+	} else {
+		d.cursor, d.offset = 0, 0
+	}
+	d.log = e
+	if e == nil {
+		d.obj, d.root, d.lines = nil, nil, nil
+		return
+	}
+	d.obj = &unstructured.Unstructured{Object: e.Fields}
+	d.root = yamltree.BuildFirst(e.Fields, "@timestamp", "timestamp", "time", "ts", "log", "level", "message", "msg")
+	d.arrange()
+	d.root.ApplyExpansionState(state)
+	d.relayout()
+	if n := d.root.Find(cursorPath); n != nil {
+		d.moveTo(n)
+	}
+	d.offset = scrollTo(d.cursor, d.offset, d.height())
 }
 
 func (d *detailView) relayout() {
@@ -213,6 +261,9 @@ func isBelow(n, group *yamltree.Node) bool {
 
 func (d *detailView) Update(msg tea.Msg) tea.Cmd {
 	if d.root == nil {
+		if k, ok := msg.(tea.KeyPressMsg); ok && (k.String() == "h" || k.String() == "left") {
+			return emit(focusMsg{focusTable})
+		}
 		return nil
 	}
 	n := d.current()
@@ -220,6 +271,9 @@ func (d *detailView) Update(msg tea.Msg) tea.Cmd {
 	case tea.KeyPressMsg:
 		switch msg.String() {
 		case "i":
+			if d.log != nil {
+				return nil
+			}
 			d.info.on = !d.info.on
 			if d.info.on {
 				return emit(needSchemaMsg{})
@@ -227,9 +281,9 @@ func (d *detailView) Update(msg tea.Msg) tea.Cmd {
 			return nil
 		case "enter", "space", "o":
 			d.toggle(n)
-		case "f":
+		case "ctrl+p": // favorite; for a log entry, pin the field to the lines
 			return d.toggleFavorite(n)
-		case "x":
+		case "ctrl+x":
 			return d.toggleHidden(n)
 		case "right", "l":
 			if n != nil && n.HasChildren() && !n.Expanded {
@@ -242,6 +296,8 @@ func (d *detailView) Update(msg tea.Msg) tea.Cmd {
 				d.toggle(n)
 			} else if n != nil && n.Parent != nil && n.Parent != d.root {
 				d.moveTo(n.Parent)
+			} else {
+				return emit(focusMsg{focusTable}) // nothing left to fold: back to the list
 			}
 		case "O":
 			d.root.SetExpanded(true)
@@ -306,6 +362,15 @@ func (d *detailView) View() string {
 		}
 	}
 	title := d.obj.GetKind() + " " + d.obj.GetName()
+	if d.log != nil {
+		title = "Log entry"
+		if !d.log.Time.IsZero() {
+			title += " " + d.log.Time.Local().Format("15:04:05.000")
+		}
+		if d.log.Format != logs.Plain {
+			title += " (" + d.log.Format.String() + ")"
+		}
+	}
 	return frame(title, footer, lines, d.rect.w, d.rect.h, d.focused)
 }
 
@@ -341,7 +406,7 @@ func (d *detailView) renderLine(n *yamltree.Node, selected bool, w int) string {
 		}
 		part(label, stMuted.Italic(true).Render)
 	case n.Kind == yamltree.Line:
-		part(n.Value.(string), stString.Render)
+		part(untab(n.Value.(string)), stString.Render)
 	case n.Index >= 0:
 		if n.HasChildren() || n.Kind == yamltree.Map || n.Kind == yamltree.List {
 			part(fmt.Sprintf("[%d]", n.Index), stMuted.Render)
@@ -416,7 +481,7 @@ func formatScalar(v any) (string, func(...string) string) {
 		if t == "" {
 			return `""`, stString.Render
 		}
-		return t, stString.Render
+		return untab(t), stString.Render
 	case bool:
 		return fmt.Sprint(t), stBool.Render
 	case int64, float64, int:
@@ -424,3 +489,7 @@ func formatScalar(v any) (string, func(...string) string) {
 	}
 	return fmt.Sprint(v), stString.Render
 }
+
+// untab expands tabs, which would otherwise move the terminal cursor past
+// the cells that widths are computed for.
+func untab(s string) string { return strings.ReplaceAll(s, "\t", "    ") }

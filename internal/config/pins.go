@@ -1,9 +1,12 @@
 package config
 
-// Pin is a favorite cluster (Namespace == "") or namespace of a cluster.
+// Pin is a favorite cluster (Namespace == ""), namespace of a cluster, or,
+// with Resource set, one resource list there. A namespaced Resource with no
+// Namespace is the list across all namespaces.
 type Pin struct {
 	Context   string `json:"context"`
 	Namespace string `json:"namespace,omitempty"`
+	Resource  string `json:"resource,omitempty"` // k8s.Resource name, e.g. "pods"
 }
 
 type pinsFile struct {

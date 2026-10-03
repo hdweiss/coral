@@ -163,3 +163,32 @@ func TestBuiltinComplete(t *testing.T) {
 		}
 	}
 }
+
+// omarchyCatppuccin is Omarchy's themes/catppuccin/colors.toml.
+const omarchyCatppuccin = `mode = "dark"
+accent = "#89b4fa"
+selection = "#45475a"
+muted = "#585b70"
+background = "#1e1e2e"
+dark_background = "#161622"
+darker_background = "#101019"
+lighter_background = "#313244"
+foreground = "#cdd6f4"
+dark_foreground = "#6c7086"
+light_foreground = "#bac2de"
+bright_foreground = "#cdd6f4"
+red = "#f38ba8"
+yellow = "#f9e2af"
+orange = "#f6b6ab"
+green = "#a6e3a1"
+cyan = "#94e2d5"
+blue = "#89b4fa"
+magenta = "#f5c2e7"
+brown = "#7b5b55"
+`
+
+func TestBuiltinCatppuccinMatchesOmarchy(t *testing.T) {
+	if got, want := Builtin["catppuccin"], ParseOmarchy([]byte(omarchyCatppuccin)); got != want {
+		t.Errorf("got  %+v\nwant %+v", got, want)
+	}
+}

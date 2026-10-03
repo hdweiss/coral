@@ -20,6 +20,12 @@ type Column struct {
 	// Drop marks a column the table may hide when space runs out. Zero means
 	// always shown; higher values are hidden first.
 	Drop int
+	// Flex marks the column that shrinks first when space runs out, for
+	// tables without NAME (events: MESSAGE).
+	Flex bool
+	// DefaultSort makes the table sort by this column when it opens,
+	// instead of the first one.
+	DefaultSort bool
 }
 
 // dropFirst returns c marked as hideable with priority p.
@@ -165,6 +171,8 @@ func Columns(r Resource) []Column {
 			colAge}
 	case "namespaces":
 		return []Column{colName, col("STATUS", field("status", "phase")), colAge}
+	case "events":
+		return eventColumns()
 	}
 	return []Column{colName, colAge}
 }

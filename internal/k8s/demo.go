@@ -120,6 +120,35 @@ func (d *demo) ts(age time.Duration) string {
 	return d.now.Add(-age).UTC().Format(time.RFC3339)
 }
 
+// event records an event about obj, first and last seen ago. Events of
+// cluster-scoped objects go to the default namespace, like the kubelet's
+// node events, which also carry the node's name as uid.
+func (d *demo) event(obj *unstructured.Unstructured, typ, reason, msg string, count int64, first, last time.Duration, component string) {
+	ns, uid := obj.GetNamespace(), string(obj.GetUID())
+	if ns == "" {
+		ns = "default"
+		if obj.GetKind() == "Node" {
+			uid = obj.GetName()
+		}
+	}
+	name := obj.GetName() + "." + hash(reason+msg+obj.GetName(), 16)
+	src := m{"component": component}
+	if component == "kubelet" {
+		if node := str(obj, "spec", "nodeName"); node != "" {
+			src["host"] = node
+		}
+	}
+	d.add("v1", "Event", ns, name, first, nil, m{
+		"involvedObject": m{
+			"apiVersion": obj.GetAPIVersion(), "kind": obj.GetKind(), "namespace": obj.GetNamespace(),
+			"name": obj.GetName(), "uid": uid, "resourceVersion": "1",
+		},
+		"type": typ, "reason": reason, "message": msg, "count": count,
+		"firstTimestamp": d.ts(first), "lastTimestamp": d.ts(last),
+		"source": src, "reportingComponent": component,
+	})
+}
+
 func ownerRef(owner *unstructured.Unstructured) l {
 	return l{m{
 		"apiVersion": owner.GetAPIVersion(), "kind": owner.GetKind(), "name": owner.GetName(),
@@ -292,6 +321,32 @@ func (d *demo) pod(a app, name string, age time.Duration, owner *unstructured.Un
 	if owner != nil {
 		p.Object["metadata"].(m)["ownerReferences"] = ownerRef(owner)
 	}
+	d.podEvents(p, a, st, age)
+}
+
+// podEvents records what the scheduler and kubelet would report for a pod in
+// state st.
+func (d *demo) podEvents(p *unstructured.Unstructured, a app, st podState, age time.Duration) {
+	switch st {
+	case crash:
+		d.event(p, "Normal", "Pulled", "Container image \""+a.image+"\" already present on machine", 17, 70*time.Minute, 4*time.Minute, "kubelet")
+		d.event(p, "Normal", "Created", "Created container: "+a.name, 17, 70*time.Minute, 4*time.Minute, "kubelet")
+		d.event(p, "Normal", "Started", "Started container "+a.name, 17, 70*time.Minute, 4*time.Minute, "kubelet")
+		d.event(p, "Warning", "Unhealthy", "Readiness probe failed: Get \"http://"+str(p, "status", "podIP")+":8080/healthz\": dial tcp: connect: connection refused", 34, 70*time.Minute, 4*time.Minute, "kubelet")
+		d.event(p, "Warning", "BackOff", "Back-off restarting failed container "+a.name+" in pod "+p.GetName()+"_"+p.GetNamespace(), 312, 68*time.Minute, 40*time.Second, "kubelet")
+	case pull:
+		d.event(p, "Normal", "Scheduled", "Successfully assigned "+p.GetNamespace()+"/"+p.GetName()+" to "+str(p, "spec", "nodeName"), 1, age, age, "default-scheduler")
+		d.event(p, "Normal", "Pulling", "Pulling image \""+a.image+"\"", 24, age, 6*time.Minute, "kubelet")
+		d.event(p, "Warning", "Failed", "Failed to pull image \""+a.image+"\": rpc error: code = NotFound desc = failed to pull and unpack image \""+a.image+"\": not found", 24, age, 6*time.Minute, "kubelet")
+		d.event(p, "Warning", "Failed", "Error: ErrImagePull", 24, age, 6*time.Minute, "kubelet")
+		d.event(p, "Normal", "BackOff", "Back-off pulling image \""+a.image+"\"", 510, age, 20*time.Second, "kubelet")
+		d.event(p, "Warning", "Failed", "Error: ImagePullBackOff", 510, age, 20*time.Second, "kubelet")
+	case pending:
+		d.event(p, "Warning", "FailedScheduling", "0/3 nodes are available: 3 Insufficient memory. preemption: 0/3 nodes are available: 3 No preemption victims found for incoming pod.", 41, 3*time.Hour, 90*time.Second, "default-scheduler")
+	case complete:
+		d.event(p, "Normal", "Scheduled", "Successfully assigned "+p.GetNamespace()+"/"+p.GetName()+" to "+str(p, "spec", "nodeName"), 1, age, age, "default-scheduler")
+		d.event(p, "Normal", "Started", "Started container "+a.name, 1, age, age, "kubelet")
+	}
 }
 
 func (d *demo) nodeName(i int) string {
@@ -335,6 +390,9 @@ func (d *demo) deployment(a app, age time.Duration) {
 	})
 	rs.Object["metadata"].(m)["ownerReferences"] = ownerRef(dep)
 
+	if age < 24*time.Hour {
+		d.event(dep, "Normal", "ScalingReplicaSet", fmt.Sprintf("Scaled up replica set %s from 0 to %d", rsName, replicas), 1, age/2, age/2, "deployment-controller")
+	}
 	for i := 0; i < a.replicas; i++ {
 		d.pod(a, rsName+"-"+hash(fmt.Sprint(a.name, i), 5), age/2-time.Duration(i)*time.Hour, rs, a.state(i), d.nodeName(i))
 	}
@@ -411,7 +469,7 @@ func buildDemoCluster(name string) []runtime.Object {
 		if !prod && i == 2 {
 			ready = "False"
 		}
-		d.add("v1", "Node", "", d.nodeName(i), 90*day, labels, m{
+		node := d.add("v1", "Node", "", d.nodeName(i), 90*day, labels, m{
 			"spec": m{"podCIDR": fmt.Sprintf("10.244.%d.0/24", i)},
 			"status": m{
 				"capacity":    m{"cpu": "8", "memory": "32Gi", "pods": "110"},
@@ -424,6 +482,10 @@ func buildDemoCluster(name string) []runtime.Object {
 				"nodeInfo": m{"kubeletVersion": "v1.37.1", "osImage": "Ubuntu 26.04 LTS", "containerRuntimeVersion": "containerd://2.2.0"},
 			},
 		})
+		if ready == "False" {
+			d.event(node, "Normal", "NodeNotReady", "Node "+node.GetName()+" status is now: NodeNotReady", 1, 25*time.Minute, 25*time.Minute, "node-controller")
+			d.event(node, "Warning", "ContainerGCFailed", "rpc error: code = Unavailable desc = connection error: dial unix /run/containerd/containerd.sock: connect: no such file or directory", 25, 25*time.Minute, time.Minute, "kubelet")
+		}
 	}
 
 	d.service("default", "kubernetes", "ClusterIP", 443, "")
@@ -508,6 +570,9 @@ func buildDemoCluster(name string) []runtime.Object {
 		"status": m{"succeeded": int64(1), "conditions": l{m{"type": "Complete", "status": "True"}}},
 	})
 	job.Object["metadata"].(m)["ownerReferences"] = ownerRef(cj)
+	d.event(cj, "Normal", "SuccessfulCreate", "Created job "+job.GetName(), 1, 9*time.Hour, 9*time.Hour, "cronjob-controller")
+	d.event(cj, "Normal", "SawCompletedJob", "Saw completed job: "+job.GetName()+", condition: Complete", 1, 9*time.Hour-time.Minute, 9*time.Hour-time.Minute, "cronjob-controller")
+	d.event(job, "Normal", "Completed", "Job completed", 1, 9*time.Hour-time.Minute, 9*time.Hour-time.Minute, "job-controller")
 	d.pod(report, "nightly-report-29312-"+hash("job", 5), 9*time.Hour, job, complete, d.nodeName(1))
 
 	// monitoring

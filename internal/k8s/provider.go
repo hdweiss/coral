@@ -1,12 +1,15 @@
 package k8s
 
 import (
+	"context"
 	"errors"
+	"io"
 	"sort"
 	"sync"
 
 	"k8s.io/client-go/discovery"
 	"k8s.io/client-go/dynamic"
+	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/openapi"
 	"k8s.io/client-go/rest"
 	"k8s.io/client-go/tools/clientcmd"
@@ -22,6 +25,9 @@ type Provider interface {
 	// OpenAPI returns the cluster's OpenAPI v3 client, or an error when the
 	// cluster has none (demo mode).
 	OpenAPI(context string) (openapi.Client, error)
+	// Logs streams a container's log, each line prefixed with its RFC3339Nano
+	// timestamp. Closing the reader or cancelling ctx ends the stream.
+	Logs(ctx context.Context, context string, req LogRequest) (io.ReadCloser, error)
 }
 
 type kubeProvider struct {
@@ -32,6 +38,7 @@ type kubeProvider struct {
 	configs map[string]*rest.Config
 	clients map[string]dynamic.Interface
 	openapi map[string]openapi.Client
+	typed   map[string]kubernetes.Interface
 }
 
 // NewKubeProvider loads the kubeconfig from path, or from the default
@@ -53,6 +60,7 @@ func NewKubeProvider(path string) (Provider, error) {
 		configs: map[string]*rest.Config{},
 		clients: map[string]dynamic.Interface{},
 		openapi: map[string]openapi.Client{},
+		typed:   map[string]kubernetes.Interface{},
 	}, nil
 }
 
@@ -131,4 +139,30 @@ func (p *kubeProvider) OpenAPI(context string) (openapi.Client, error) {
 	c := dc.OpenAPIV3()
 	p.openapi[context] = c
 	return c, nil
+}
+
+func (p *kubeProvider) clientset(context string) (kubernetes.Interface, error) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if c, ok := p.typed[context]; ok {
+		return c, nil
+	}
+	rc, err := p.config(context)
+	if err != nil {
+		return nil, err
+	}
+	c, err := kubernetes.NewForConfig(rc)
+	if err != nil {
+		return nil, err
+	}
+	p.typed[context] = c
+	return c, nil
+}
+
+func (p *kubeProvider) Logs(ctx context.Context, context string, req LogRequest) (io.ReadCloser, error) {
+	c, err := p.clientset(context)
+	if err != nil {
+		return nil, err
+	}
+	return c.CoreV1().Pods(req.Namespace).GetLogs(req.Pod, req.options()).Stream(ctx)
 }

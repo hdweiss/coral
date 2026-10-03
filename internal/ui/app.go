@@ -16,6 +16,7 @@ import (
 	"github.com/hdweiss/coralctl/internal/schema"
 	"github.com/hdweiss/coralctl/internal/theme"
 	"github.com/hdweiss/coralctl/internal/yamltree"
+	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/util/duration"
 )
 
@@ -36,7 +37,6 @@ const (
 	focusNav focusID = iota
 	focusTable
 	focusDetail
-	focusPins
 )
 
 type (
@@ -66,10 +66,11 @@ type App struct {
 	opts  Options
 
 	w, h   int
-	pins   *pinsView
 	nav    *navView
 	table  *tableView
 	detail *detailView
+	logs   *logView      // shown in place of the table while open
+	desc   *describeView // events (E) or describe (d), in place of the table
 	focus  focusID
 
 	ctx string // current context
@@ -152,13 +153,12 @@ func New(store *k8s.Store, opts Options) (*App, error) {
 		builtin:       schema.NewBuiltin(),
 	}
 	contexts := p.Contexts()
-	a.pins = &pinsView{known: func(c string) bool { return slices.Contains(contexts, c) }}
+	a.nav.known = func(c string) bool { return slices.Contains(contexts, c) }
 	if pins, err := config.LoadPins(opts.PinsPath); err != nil {
 		a.setFlash("loading pins: "+err.Error(), true)
 	} else {
-		a.pins.pins = pins
+		a.nav.SetPins(pins)
 	}
-	a.nav.pinned = a.pins.has
 	fields, err := config.LoadFields(opts.FieldsPath)
 	if err != nil {
 		a.setFlash("loading fields: "+err.Error(), true)
@@ -198,6 +198,8 @@ func (a *App) fetch(key k8s.Key) tea.Cmd {
 
 // activate shows a resource list, from cache when possible.
 func (a *App) activate(key k8s.Key, res k8s.Resource) tea.Cmd {
+	a.closeLogs()
+	a.closeDesc()
 	a.cur, a.ctx = key, key.Context
 	if res.Namespaced {
 		a.ns = key.Namespace
@@ -217,19 +219,201 @@ func (a *App) activate(key k8s.Key, res k8s.Resource) tea.Cmd {
 	if !ok || time.Since(e.FetchedAt) > freshFor {
 		cmds = append(cmds, a.fetch(key))
 	}
+	if ek, ok := a.warningsKey(); ok {
+		ee, cached := a.store.Get(ek)
+		if cached {
+			a.setWarnings(ee)
+		}
+		if !cached || time.Since(ee.FetchedAt) > freshFor {
+			cmds = append(cmds, a.fetch(ek))
+		}
+	}
 	return tea.Batch(cmds...)
 }
 
-func (a *App) syncDetail() { a.detail.SetObject(a.table.Selected()) }
+// warningsKey is the event list behind the table's warning markers. The
+// events list itself has none.
+func (a *App) warningsKey() (k8s.Key, bool) {
+	if a.cur.GVR == k8s.EventsGVR {
+		return k8s.Key{}, false
+	}
+	return k8s.EventsKey(a.cur), true
+}
+
+func (a *App) setWarnings(e k8s.Entry) {
+	if e.Err == nil {
+		a.table.SetWarnings(k8s.IndexWarnings(e.Items, time.Now().Add(-k8s.WarningWindow)))
+	}
+}
+
+func (a *App) syncDetail() {
+	if a.desc != nil {
+		obj := a.desc.SelectedObject()
+		if obj == nil {
+			obj = a.desc.subject
+		}
+		a.detail.SetObject(obj)
+		return
+	}
+	if a.logs != nil {
+		a.detail.SetLog(a.logs.Selected())
+		return
+	}
+	a.detail.SetObject(a.table.Selected())
+}
+
+// logPod is the pod whose log L and p open: the table's selected pod, or the
+// pod selected or described in the events or describe view.
+func (a *App) logPod() *unstructured.Unstructured {
+	if a.desc != nil {
+		pod := a.desc.SelectedObject()
+		if pod == nil || pod.GetKind() != "Pod" {
+			pod = a.desc.subject
+		}
+		if pod.GetKind() == "Pod" {
+			return pod
+		}
+		return nil
+	}
+	if a.table.res.Name != "pods" {
+		return nil
+	}
+	return a.table.Selected()
+}
+
+// openLogs shows the log of the selected pod in place of the table.
+func (a *App) openLogs() tea.Cmd {
+	pod := a.logPod()
+	if pod == nil {
+		a.setFlash("logs: select a pod", true)
+		return nil
+	}
+	if a.filtering {
+		a.stopFilter(false)
+	}
+	a.closeDesc()
+	a.logs = newLogView(a.cur.Context, pod, a.detail.fields)
+	a.setFocus(focusTable)
+	cmd := a.logs.start(a.store.Provider())
+	a.syncDetail()
+	return cmd
+}
+
+// openDescribe shows the events (E) or the description (d) of the selected
+// object in place of the table. From such a view it opens the selected
+// related object's, on top of the current view; on anything else the same
+// key goes back.
+func (a *App) openDescribe(eventsOnly bool) tea.Cmd {
+	var subject *unstructured.Unstructured
+	switch {
+	case a.desc != nil:
+		r, ok := a.desc.Selected()
+		switch {
+		case ok && r.kind == descObject && r.rel.Obj != nil:
+			subject = r.rel.Obj
+		case a.desc.eventsOnly == eventsOnly:
+			return a.popDesc()
+		default:
+			subject = a.desc.subject
+		}
+	case a.logs != nil:
+		subject = a.logs.pod
+	default:
+		subject = a.table.Selected()
+	}
+	if subject == nil {
+		a.setFlash("select an object first", true)
+		return nil
+	}
+	if a.filtering {
+		a.stopFilter(false)
+	}
+	v := newDescribeView(a.cur.Context, subject, eventsOnly)
+	v.prev = a.desc
+	a.closeLogs()
+	a.desc = v
+	a.setFocus(focusTable)
+	cmd := v.load(a.store, freshFor, freshFor)
+	a.syncDetail()
+	return cmd
+}
+
+// popDesc goes back to the view the current one was opened from, or to the
+// table.
+func (a *App) popDesc() tea.Cmd {
+	if a.desc == nil {
+		return nil
+	}
+	if a.filtering {
+		a.stopFilter(false)
+	}
+	a.desc = a.desc.prev
+	var cmd tea.Cmd
+	if a.desc != nil && time.Since(a.desc.at) > freshFor {
+		cmd = a.desc.load(a.store, freshFor, freshFor)
+	}
+	a.setFocus(focusTable)
+	a.syncDetail()
+	return cmd
+}
+
+func (a *App) closeDesc() {
+	if a.desc == nil {
+		return
+	}
+	if a.filtering {
+		a.stopFilter(false)
+	}
+	a.desc = nil
+	a.syncDetail()
+	a.layout()
+}
+
+// jump shows a related object in its list.
+func (a *App) jump(rel k8s.Related) tea.Cmd {
+	if rel.Obj == nil {
+		a.setFlash(rel.Kind+" "+rel.Name+" not found", true)
+		return nil
+	}
+	ns := rel.Obj.GetNamespace()
+	if a.ns == "" {
+		ns = "" // stay in all namespaces
+	}
+	cmd := a.activate(a.keyFor(a.ctx, ns, rel.Res), rel.Res)
+	a.table.Select(string(rel.Obj.GetUID()))
+	a.syncDetail()
+	return cmd
+}
+
+// subview reports whether a log, events or describe view replaces the table.
+func (a *App) subview() bool { return a.logs != nil || a.desc != nil }
+
+func (a *App) closeLogs() {
+	if a.logs == nil {
+		return
+	}
+	if a.filtering {
+		a.stopFilter(false)
+	}
+	a.logs.stop()
+	a.logs = nil
+	a.syncDetail()
+	a.layout()
+}
 
 func (a *App) setFocus(f focusID) {
-	if f == focusPins && len(a.pins.pins) == 0 {
-		f = focusNav
-	}
 	a.focus = f
-	a.pins.focused = f == focusPins
 	a.nav.focused = f == focusNav
 	a.table.focused = f == focusTable
+	if a.logs != nil {
+		a.logs.focused = f == focusTable
+		if f == focusDetail {
+			a.logs.follow = false // keep the inspected entry
+		}
+	}
+	if a.desc != nil {
+		a.desc.focused = f == focusTable
+	}
 	a.detail.focused = f == focusDetail
 	a.layout()
 }
@@ -237,9 +421,6 @@ func (a *App) setFocus(f focusID) {
 // cycleFocus moves focus by step through the panels in screen order.
 func (a *App) cycleFocus(step int) {
 	order := []focusID{focusNav, focusTable, focusDetail}
-	if len(a.pins.pins) > 0 {
-		order = append([]focusID{focusPins}, order...)
-	}
 	i := max(slices.Index(order, a.focus), 0)
 	a.setFocus(order[(i+step+len(order))%len(order)])
 }
@@ -254,41 +435,27 @@ func (a *App) currentPin() config.Pin {
 }
 
 func (a *App) togglePin(pin config.Pin) {
-	added := a.pins.toggle(pin)
-	label := "⎈ " + pin.Context
-	if pin.Namespace != "" {
-		label = pin.Context + " › " + pin.Namespace
-	}
+	added := a.nav.togglePin(pin)
+	label := pinLabel(pin)
 	if added {
 		a.setFlash("pinned "+label, false)
 	} else {
 		a.setFlash("unpinned "+label, false)
 	}
-	if err := config.SavePins(a.opts.PinsPath, a.pins.pins); err != nil {
+	if err := config.SavePins(a.opts.PinsPath, a.nav.pins); err != nil {
 		a.setFlash("saving pins: "+err.Error(), true)
 	}
-	if a.focus == focusPins && len(a.pins.pins) == 0 {
-		a.setFocus(focusNav)
-	}
-	a.layout()
+	a.clampScroll()
 }
 
-// openPin jumps to a pinned cluster or namespace, keeping the resource type
-// when it makes sense there.
+// openPin jumps to a pinned namespace, keeping the resource type when it is
+// namespaced.
 func (a *App) openPin(pin config.Pin) tea.Cmd {
-	if !slices.Contains(a.store.Provider().Contexts(), pin.Context) {
-		a.setFlash("context "+pin.Context+" is not in the kubeconfig", true)
-		return nil
-	}
 	res, _ := k8s.Lookup(a.table.res.Name)
-	ns := pin.Namespace
-	if ns == "" {
-		ns = a.store.Provider().DefaultNamespace(pin.Context)
-	} else if !res.Namespaced {
+	if !res.Namespaced {
 		res = k8s.MustLookup("pods")
 	}
-	a.nav.root(pin.Context).expanded = true
-	return a.activate(a.keyFor(pin.Context, ns, res), res)
+	return a.activate(a.keyFor(pin.Context, pin.Namespace, res), res)
 }
 
 func (a *App) setFlash(msg string, isErr bool) {
@@ -325,12 +492,34 @@ func (a *App) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				a.setFlash(msg.entry.Err.Error(), true)
 			}
 		}
+		if k, ok := a.warningsKey(); ok && msg.key == k {
+			a.setWarnings(msg.entry)
+		}
+	case describeMsg:
+		msg.view.onLoaded(msg)
+		if msg.view == a.desc {
+			a.syncDetail()
+			if msg.err != nil {
+				a.setFlash(msg.err.Error(), true)
+			}
+		}
+	case jumpMsg:
+		cmd = a.jump(msg.rel)
+	case openEventsMsg:
+		cmd = a.openDescribe(true)
 	case activateMsg:
 		cmd = a.activate(msg.key, msg.res)
+	case logLinesMsg:
+		if a.logs != nil {
+			cmd = a.logs.onLines(msg)
+			a.syncDetail()
+		}
 	case needNamespacesMsg:
 		cmd = a.fetch(k8s.Key{Context: msg.context, GVR: nsGVR})
 	case openDetailMsg:
 		a.setFocus(focusDetail)
+	case focusMsg:
+		a.setFocus(msg.f)
 	case editReadyMsg:
 		cmd = a.onEditReady(msg)
 	case editorExitMsg:
@@ -361,6 +550,13 @@ func (a *App) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		if e, ok := a.store.Get(a.cur); ok && a.opts.Refresh > 0 && time.Since(e.FetchedAt) >= a.opts.Refresh {
 			cmds = append(cmds, a.fetch(a.cur))
+			if ek, ok := a.warningsKey(); ok {
+				cmds = append(cmds, a.fetch(ek))
+			}
+		}
+		// Events change often; what they relate to rarely does.
+		if d := a.desc; d != nil && !d.loading && a.opts.Refresh > 0 && time.Since(d.at) >= a.opts.Refresh {
+			cmds = append(cmds, d.load(a.store, 0, 30*time.Second))
 		}
 		cmd = tea.Batch(cmds...)
 	case tea.KeyPressMsg:
@@ -446,8 +642,7 @@ func (a *App) handleKey(msg tea.KeyPressMsg) tea.Cmd {
 		}
 		var cmd tea.Cmd
 		a.filterInput, cmd = a.filterInput.Update(msg)
-		a.table.SetFilter(a.filterInput.Value())
-		a.syncDetail()
+		a.setFilter(a.filterInput.Value())
 		return cmd
 	}
 
@@ -473,12 +668,41 @@ func (a *App) handleKey(msg tea.KeyPressMsg) tea.Cmd {
 		a.cycleFocus(-1)
 		return nil
 	case "0":
-		a.setFocus(focusPins)
-		return nil
-	case "1", "2", "3":
-		a.setFocus(focusID(key[0] - '1'))
-		return nil
+		return a.allNamespaces()
+	case "1", "2", "3", "4", "5", "6", "7", "8", "9":
+		return a.openPinNumber(int(key[0] - '0'))
+	case "ctrl+p":
+		if a.focus == focusTable && !a.subview() {
+			a.togglePin(a.currentPin())
+			return nil
+		}
+	case "p":
+		if a.focus != focusNav {
+			return a.previousLogs()
+		}
+	case "y":
+		if a.focus == focusTable {
+			a.setFocus(focusDetail)
+			return nil
+		}
+	case "L":
+		if a.logs != nil {
+			a.closeLogs()
+			return nil
+		}
+		return a.openLogs()
+	case "E":
+		if a.focus != focusNav {
+			return a.openDescribe(true)
+		}
+	case "d":
+		if a.focus != focusNav {
+			return a.openDescribe(false)
+		}
 	case "e":
+		if a.logs != nil {
+			return nil // log entries are not objects
+		}
 		switch a.focus {
 		case focusTable:
 			return a.startEdit(nil)
@@ -489,11 +713,18 @@ func (a *App) handleKey(msg tea.KeyPressMsg) tea.Cmd {
 			}
 			return a.startEdit(focus)
 		}
-	case "a":
-		if a.focus == focusTable || a.focus == focusDetail {
+	case "ctrl+n":
+		if a.logs == nil && (a.focus == focusTable || a.focus == focusDetail) {
 			return a.startAdd()
 		}
-	case "r":
+	case "r", "ctrl+r":
+		if a.logs != nil {
+			return a.logs.start(a.store.Provider())
+		}
+		if a.desc != nil {
+			a.setFlash("refreshing…", false)
+			return a.desc.load(a.store, 0, 0)
+		}
 		a.setFlash("refreshing…", false)
 		return tea.Batch(a.fetch(a.cur), a.fetch(k8s.Key{Context: a.ctx, GVR: nsGVR}))
 	case "z":
@@ -507,12 +738,22 @@ func (a *App) handleKey(msg tea.KeyPressMsg) tea.Cmd {
 		case a.zoom:
 			a.zoom = false
 			a.layout()
-		case a.table.filter != "":
+		case a.logs != nil && a.logs.filter != "":
+			a.logs.SetFilter("")
+			a.syncDetail()
+		case a.desc != nil && a.desc.filter != "":
+			a.desc.SetFilter("")
+			a.syncDetail()
+		case !a.subview() && a.table.filter != "":
 			a.table.SetFilter("")
 			a.syncDetail()
 		case a.focus == focusDetail:
 			a.setFocus(focusTable)
-		case a.focus == focusTable, a.focus == focusPins:
+		case a.logs != nil:
+			a.closeLogs()
+		case a.desc != nil:
+			return a.popDesc()
+		case a.focus == focusTable:
 			a.setFocus(focusNav)
 		}
 		return nil
@@ -520,11 +761,12 @@ func (a *App) handleKey(msg tea.KeyPressMsg) tea.Cmd {
 
 	var cmd tea.Cmd
 	switch a.focus {
-	case focusPins:
-		cmd = a.pins.Update(msg)
 	case focusNav:
 		cmd = a.nav.Update(msg)
 	case focusTable:
+		if a.desc != nil && key == "enter" {
+			return a.desc.activate()
+		}
 		if key == "enter" || key == "right" || key == "l" {
 			a.setFocus(focusDetail)
 			return nil
@@ -532,6 +774,14 @@ func (a *App) handleKey(msg tea.KeyPressMsg) tea.Cmd {
 		if key == "left" || key == "h" {
 			a.setFocus(focusNav)
 			return nil
+		}
+		if a.logs != nil {
+			return a.logKey(msg)
+		}
+		if a.desc != nil {
+			cmd = a.desc.Update(msg)
+			a.syncDetail()
+			return cmd
 		}
 		cmd = a.table.Update(msg)
 		a.syncDetail()
@@ -541,9 +791,109 @@ func (a *App) handleKey(msg tea.KeyPressMsg) tea.Cmd {
 	return cmd
 }
 
+// previousLogs shows the log of the previous container: from the log view it
+// toggles, from a pod it opens the log that way.
+func (a *App) previousLogs() tea.Cmd {
+	if a.logs != nil {
+		a.logs.previous = !a.logs.previous
+		return a.logs.start(a.store.Provider())
+	}
+	if a.logPod() == nil {
+		return nil
+	}
+	cmd := a.openLogs()
+	if a.logs == nil {
+		return cmd
+	}
+	a.logs.previous = true
+	return a.logs.start(a.store.Provider())
+}
+
+// allNamespaces shows the current resource across all namespaces, or pods
+// when the resource is cluster-scoped (k9s's 0).
+func (a *App) allNamespaces() tea.Cmd {
+	res, _ := k8s.Lookup(a.table.res.Name)
+	if !res.Namespaced {
+		res = k8s.MustLookup("pods")
+	}
+	return a.activate(a.keyFor(a.ctx, "", res), res)
+}
+
+// openPinNumber opens the n-th pin (1-based), in the order pins were added.
+func (a *App) openPinNumber(n int) tea.Cmd {
+	if n > len(a.nav.pins) {
+		a.setFlash(fmt.Sprintf("no pin %d", n), true)
+		return nil
+	}
+	pin := a.nav.pins[n-1]
+	p := a.store.Provider()
+	if !slices.Contains(p.Contexts(), pin.Context) {
+		a.setFlash("context "+pin.Context+" is not in the kubeconfig", true)
+		return nil
+	}
+	switch {
+	case pin.Resource != "":
+		res, ok := k8s.Lookup(pin.Resource)
+		if !ok {
+			a.setFlash("unknown resource "+pin.Resource, true)
+			return nil
+		}
+		return a.activate(a.keyFor(pin.Context, pin.Namespace, res), res)
+	case pin.Namespace != "":
+		return a.openPin(pin)
+	}
+	res, _ := k8s.Lookup(a.table.res.Name)
+	return a.activate(a.keyFor(pin.Context, p.DefaultNamespace(pin.Context), res), res)
+}
+
+// logKey handles a key in the log view.
+func (a *App) logKey(msg tea.KeyPressMsg) tea.Cmd {
+	switch msg.String() {
+	case "c":
+		if !a.logs.nextContainer() {
+			a.setFlash("the pod has one container", false)
+			return nil
+		}
+		return a.logs.start(a.store.Provider())
+	case "s": // autoscroll, as in k9s
+		a.logs.follow = !a.logs.follow
+		if a.logs.follow {
+			a.logs.cursor = max(len(a.logs.rows)-1, 0)
+			a.logs.scroll()
+			a.syncDetail()
+		}
+		return nil
+	case "f": // fullscreen, as in k9s
+		a.zoom = !a.zoom
+		a.layout()
+		return nil
+	}
+	cmd := a.logs.Update(msg)
+	a.syncDetail()
+	return cmd
+}
+
+// setFilter filters the log view while it is open, else the table.
+func (a *App) setFilter(f string) {
+	if a.desc != nil {
+		a.desc.SetFilter(f)
+	} else if a.logs != nil {
+		a.logs.SetFilter(f)
+	} else {
+		a.table.SetFilter(f)
+	}
+	a.syncDetail()
+}
+
 func (a *App) startFilter() tea.Cmd {
 	a.filtering = true
-	a.filterInput.SetValue(a.table.filter)
+	if a.desc != nil {
+		a.filterInput.SetValue(a.desc.filter)
+	} else if a.logs != nil {
+		a.filterInput.SetValue(a.logs.filter)
+	} else {
+		a.filterInput.SetValue(a.table.filter)
+	}
 	a.filterInput.CursorEnd()
 	if a.focus == focusNav {
 		a.setFocus(focusTable)
@@ -555,8 +905,7 @@ func (a *App) stopFilter(clear bool) {
 	a.filtering = false
 	a.filterInput.Blur()
 	if clear {
-		a.table.SetFilter("")
-		a.syncDetail()
+		a.setFilter("")
 	}
 }
 
@@ -670,11 +1019,22 @@ type panelRef struct {
 	update func(tea.Msg) tea.Cmd
 }
 
+// mainUpdate sends a panel message to the log view when it is open, else
+// to the table.
+func (a *App) mainUpdate(msg tea.Msg) tea.Cmd {
+	if a.desc != nil {
+		return a.desc.Update(msg)
+	}
+	if a.logs != nil {
+		return a.logs.Update(msg)
+	}
+	return a.table.Update(msg)
+}
+
 func (a *App) panels() []panelRef {
 	return []panelRef{
-		{focusPins, a.pins.rect, a.pins.Update},
 		{focusNav, a.nav.rect, a.nav.Update},
-		{focusTable, a.table.rect, a.table.Update},
+		{focusTable, a.table.rect, a.mainUpdate},
 		{focusDetail, a.detail.rect, a.detail.Update},
 	}
 }
@@ -705,13 +1065,11 @@ func (a *App) layout() {
 	}
 	bodyY, bodyH := 1, max(a.h-2, 3)
 	full := rect{0, bodyY, a.w, bodyH}
-	a.pins.rect, a.nav.rect, a.table.rect, a.detail.rect = rect{}, rect{}, rect{}, rect{}
+	a.nav.rect, a.table.rect, a.detail.rect = rect{}, rect{}, rect{}
 
 	narrow := a.w < narrowWidth
 	if a.zoom || (narrow && a.focus == focusDetail) {
 		switch a.focus {
-		case focusPins:
-			a.pins.rect = full
 		case focusNav:
 			a.nav.rect = full
 		case focusTable:
@@ -724,29 +1082,29 @@ func (a *App) layout() {
 	}
 
 	a.navW = clamp(a.navW, 16, a.w/2)
-	// The pinned box sits on top of the navigator and takes at most a third
-	// of the column.
-	pinsH := min(a.pins.wantHeight(), max(bodyH/3, 3))
-	a.pins.rect = rect{0, bodyY, a.navW, pinsH}
-	if pinsH == 0 {
-		a.pins.rect = rect{}
-	}
 	if narrow {
-		a.nav.rect = rect{0, bodyY + pinsH, a.navW, bodyH - pinsH}
+		a.nav.rect = rect{0, bodyY, a.navW, bodyH}
 		a.table.rect = rect{a.navW, bodyY, a.w - a.navW, bodyH}
 		a.clampScroll()
 		return
 	}
 	a.detailW = clamp(a.detailW, 24, a.w-a.navW-30)
 	tableW := a.w - a.navW - a.detailW
-	a.nav.rect = rect{0, bodyY + pinsH, a.navW, bodyH - pinsH}
+	a.nav.rect = rect{0, bodyY, a.navW, bodyH}
 	a.table.rect = rect{a.navW, bodyY, tableW, bodyH}
 	a.detail.rect = rect{a.navW + tableW, bodyY, a.detailW, bodyH}
 	a.clampScroll()
 }
 
 func (a *App) clampScroll() {
-	a.pins.offset = scrollTo(a.pins.cursor, a.pins.offset, a.pins.height())
+	if a.desc != nil {
+		a.desc.rect = a.table.rect
+		a.desc.scroll()
+	}
+	if a.logs != nil {
+		a.logs.rect = a.table.rect
+		a.logs.offset = scrollTo(a.logs.cursor, a.logs.offset, a.logs.height())
+	}
 	a.nav.offset = scrollTo(a.nav.cursor, a.nav.offset, a.nav.height())
 	a.table.offset = scrollTo(a.table.cursor, a.table.offset, a.table.height())
 	a.detail.offset = scrollTo(a.detail.cursor, a.detail.offset, a.detail.height())
@@ -769,13 +1127,16 @@ func (a *App) openPalette(initial string) tea.Cmd {
 		items = append(items, paletteItem{cmd: "ctx " + c, desc: "switch context"})
 	}
 	pinDesc := "pin this namespace"
-	if pin := a.currentPin(); a.pins.has(pin) {
+	if pin := a.currentPin(); a.nav.hasPin(pin) {
 		pinDesc = "unpin this namespace"
 	}
 	if !a.table.res.Namespaced {
 		pinDesc = strings.Replace(pinDesc, "namespace", "cluster", 1)
 	}
 	items = append(items, paletteItem{cmd: "pin", desc: pinDesc, aliases: []string{"unpin"}})
+	if a.table.res.Name == "pods" {
+		items = append(items, paletteItem{cmd: "logs", desc: "show the selected pod's log", aliases: []string{"log"}})
+	}
 	items = append(items, paletteItem{cmd: "quit", desc: "exit coral", aliases: []string{"q"}})
 	a.palette = newPalette(items, initial)
 	return a.palette.input.Focus()
@@ -793,6 +1154,8 @@ func (a *App) runCommand(text string) tea.Cmd {
 	case "pin", "unpin":
 		a.togglePin(a.currentPin())
 		return nil
+	case "logs", "log":
+		return a.openLogs()
 	case "ctx", "context":
 		if len(f) < 2 {
 			return a.openPalette("ctx ")
@@ -852,17 +1215,16 @@ func (a *App) View() tea.View {
 	}
 	a.buttons = a.buttons[:0]
 
-	a.pins.ctx, a.pins.ns, a.pins.nsScoped = a.ctx, a.ns, a.table.res.Namespaced
 	var parts []string
-	switch {
-	case a.pins.rect.h > 0 && a.nav.rect.h > 0:
-		parts = append(parts, a.pins.View()+"\n"+a.nav.View())
-	case a.pins.rect.h > 0:
-		parts = append(parts, a.pins.View())
-	case a.nav.rect.w > 0:
+	if a.nav.rect.w > 0 {
 		parts = append(parts, a.nav.View())
 	}
-	if a.table.rect.w > 0 {
+	switch {
+	case a.table.rect.w > 0 && a.desc != nil:
+		parts = append(parts, a.desc.View())
+	case a.table.rect.w > 0 && a.logs != nil:
+		parts = append(parts, a.logs.View())
+	case a.table.rect.w > 0:
 		parts = append(parts, a.table.View())
 	}
 	if a.detail.rect.w > 0 {
@@ -881,7 +1243,7 @@ func (a *App) View() tea.View {
 		box := a.palette.View(a.w)
 		content = overlay(content, box, a.palette.rect.x, a.palette.rect.y)
 	case a.help:
-		box := helpView()
+		box := helpView(a.w, a.h)
 		content = overlay(content, box, (a.w-lipgloss.Width(box))/2, max((a.h-lipgloss.Height(box))/2, 0))
 	}
 	v.SetContent(content)
@@ -956,22 +1318,36 @@ func (a *App) renderHeader() string {
 		seg(stBar.Render(ns), func() tea.Cmd { return a.openPalette("ns ") })
 	}
 	star := stBarText.Render(" ☆")
-	if a.pins.has(a.currentPin()) {
+	if a.nav.hasPin(a.currentPin()) {
 		star = stBarKey.Render(" ★")
 	}
 	seg(star, func() tea.Cmd { a.togglePin(a.currentPin()); return nil })
 	seg(sep, nil)
 	seg(stBar.Foreground(colAccent).Bold(true).Render(a.table.res.Title), func() tea.Cmd { return a.openPalette("") })
-	if o := a.table.Selected(); o != nil {
+	if a.desc != nil {
+		seg(sep, nil)
+		seg(stBar.Render(a.desc.name()), nil)
+		seg(sep, nil)
+		seg(stBar.Foreground(colAccent).Bold(true).Render(a.desc.label()), func() tea.Cmd { return a.popDesc() })
+	} else if a.logs != nil {
+		seg(sep, nil)
+		seg(stBar.Render(a.logs.pod.GetName()), nil)
+		seg(sep, nil)
+		seg(stBar.Foreground(colAccent).Bold(true).Render("Logs"), func() tea.Cmd { a.closeLogs(); return nil })
+	} else if o := a.table.Selected(); o != nil {
 		seg(sep, nil)
 		seg(stBar.Render(o.GetName()), nil)
 	}
 
 	right := ""
-	if a.table.loading {
+	switch {
+	case a.subview():
+	case a.table.loading:
 		right = "⟳ loading "
-	} else if e, ok := a.store.Get(a.cur); ok {
-		right = "updated " + duration.HumanDuration(time.Since(e.FetchedAt)) + " ago "
+	default:
+		if e, ok := a.store.Get(a.cur); ok {
+			right = "updated " + duration.HumanDuration(time.Since(e.FetchedAt)) + " ago "
+		}
 	}
 	right = stBarText.Render(right)
 	help := stBarKey.Render(" ? ") + stBarText.Render("help ")
@@ -1006,28 +1382,63 @@ func (a *App) renderStatus() string {
 		{"tab", "focus", func() tea.Cmd { a.cycleFocus(1); return nil }},
 		{"z", "zoom", func() tea.Cmd { a.zoom = !a.zoom; a.layout(); return nil }},
 	}
+	press := func(update func(tea.Msg) tea.Cmd, k tea.KeyPressMsg) func() tea.Cmd {
+		return func() tea.Cmd { return update(k) }
+	}
 	switch a.focus {
 	case focusNav:
-		hints = append(hints, hint{"p", "pin", func() tea.Cmd { return a.nav.Update(tea.KeyPressMsg{Code: 'p', Text: "p"}) }})
-	case focusPins:
-		hints = append(hints, hint{"p", "unpin", func() tea.Cmd { return a.pins.Update(tea.KeyPressMsg{Code: 'p', Text: "p"}) }})
+		hints = append(hints, hint{"^p", "pin", press(a.nav.Update, ctrlKey('p'))})
 	case focusTable:
-		hints = append(hints,
+		if a.logs != nil {
+			logKey := func(m tea.Msg) tea.Cmd { return a.logKey(m.(tea.KeyPressMsg)) }
+			hints = append(hints, hint{"esc", "back", func() tea.Cmd { a.closeLogs(); return nil }},
+				hint{"s", "autoscroll", press(logKey, plainKey('s'))}, hint{"p", "previous", a.previousLogs})
+			if len(a.logs.containers) > 1 {
+				hints = append(hints, hint{"c", "container", press(logKey, plainKey('c'))})
+			}
+			break
+		}
+		describe := hint{"d", "describe", func() tea.Cmd { return a.openDescribe(false) }}
+		events := hint{"E", "events", func() tea.Cmd { return a.openDescribe(true) }}
+		if a.desc != nil {
+			hints = append(hints, hint{"esc", "back", a.popDesc})
+			switch r, ok := a.desc.Selected(); {
+			case ok && r.kind == descObject:
+				hints = append(hints, hint{"enter", "go to", a.desc.activate}, describe, events)
+			case a.desc.eventsOnly:
+				hints = append(hints, describe)
+			default:
+				hints = append(hints, events)
+			}
+			if a.logPod() != nil {
+				hints = append(hints, hint{"L", "logs", a.openLogs})
+			}
+			hints = append(hints, hint{"e", "edit", func() tea.Cmd { return a.startEdit(nil) }})
+			break
+		}
+		if a.table.res.Name == "pods" {
+			hints = append(hints, hint{"L", "logs", a.openLogs})
+		}
+		hints = append(hints, describe, events,
 			hint{"e", "edit", func() tea.Cmd { return a.startEdit(nil) }},
-			hint{"a", "add", a.startAdd})
-		hints = append(hints, hint{"s", "sort", func() tea.Cmd { return a.table.Update(tea.KeyPressMsg{Code: 's', Text: "s"}) }})
+			hint{"^n", "add", a.startAdd},
+			hint{"s", "sort", press(a.table.Update, plainKey('s'))})
 	case focusDetail:
-		key := func(k rune) func() tea.Cmd {
-			return func() tea.Cmd { return a.detail.Update(tea.KeyPressMsg{Code: k, Text: string(k)}) }
+		if a.logs != nil {
+			hints = append(hints, hint{"^p", "pin to lines", press(a.detail.Update, ctrlKey('p'))},
+				hint{"^x", "hide", press(a.detail.Update, ctrlKey('x'))},
+				hint{"O", "expand all", press(a.detail.Update, plainKey('O'))},
+				hint{"C", "collapse all", press(a.detail.Update, plainKey('C'))})
+			break
 		}
 		hints = append(hints,
-			hint{"e", "edit", func() tea.Cmd { return a.handleKey(tea.KeyPressMsg{Code: 'e', Text: "e"}) }},
-			hint{"a", "add", a.startAdd},
-			hint{"i", "info", key('i')},
-			hint{"f", "favorite", key('f')}, hint{"x", "hide", key('x')})
-		hints = append(hints,
-			hint{"O", "expand all", func() tea.Cmd { return a.detail.Update(tea.KeyPressMsg{Code: 'O', Text: "O"}) }},
-			hint{"C", "collapse all", func() tea.Cmd { return a.detail.Update(tea.KeyPressMsg{Code: 'C', Text: "C"}) }})
+			hint{"e", "edit", func() tea.Cmd { return a.handleKey(plainKey('e')) }},
+			hint{"^n", "add", a.startAdd},
+			hint{"i", "info", press(a.detail.Update, plainKey('i'))},
+			hint{"^p", "favorite", press(a.detail.Update, ctrlKey('p'))},
+			hint{"^x", "hide", press(a.detail.Update, ctrlKey('x'))},
+			hint{"O", "expand all", press(a.detail.Update, plainKey('O'))},
+			hint{"C", "collapse all", press(a.detail.Update, plainKey('C'))})
 	}
 	hints = append(hints, hint{"q", "quit", func() tea.Cmd { return tea.Quit }})
 
@@ -1057,32 +1468,49 @@ func (a *App) renderStatus() string {
 	return left + stBar.Render(strings.Repeat(" ", pad)) + right
 }
 
-func helpView() string {
-	sections := []struct {
-		title string
-		keys  [][2]string
-	}{
+// helpView renders the key help, in two columns when one column would be
+// taller than h and the screen (w) is wide enough.
+func helpView(w, h int) string {
+	sections := []helpSection{
 		{"Global", [][2]string{
-			{":", "command palette (po, deploy, ns <name>, ctx <name>)"},
-			{"/", "filter the table"},
-			{"tab / 0 1 2 3", "focus pinned / navigator / table / details"},
-			{"p", "pin / unpin the namespace or cluster (also :pin)"},
+			{":", "command palette (po, deploy, ev, ns <name>, ctx <name>, pin, logs)"},
+			{"/", "filter the table or log"},
+			{"0", "all namespaces"},
+			{"1-9", "open pin 1-9 (numbered in the navigator)"},
+			{"tab h l", "move between panels"},
+			{"ctrl+p", "pin / unpin: navigator node, or here (namespace or cluster) from the table"},
 			{"z", "zoom the focused panel"},
-			{"r", "refresh"},
+			{"r ctrl+r", "refresh"},
 			{"esc", "back / clear filter / unzoom"},
 			{"q", "quit"},
 		}},
 		{"Lists and trees", [][2]string{
 			{"↑↓ j k", "move"},
-			{"pgup pgdn g G", "page / top / bottom"},
+			{"pgup pgdn g G", "page / top / bottom (also ctrl+b ctrl+f)"},
 			{"← → h l", "collapse / expand, or move between panels"},
-			{"enter space", "open / toggle"},
+			{"enter space", "open / toggle; on a resource in the navigator, go to its list"},
+			{"y", "table: go to the YAML details"},
 			{"s S", "table: next sort column / reverse"},
-			{"O C", "details: expand all / collapse all"},
-			{"f x", "details: favorite (to the top) / hide (to the bottom)"},
 			{"e", "edit the object in $EDITOR (at the selected field)"},
-			{"a", "add a field below the selected one, from the API schema"},
+			{"ctrl+n", "add a field below the selected one, from the API schema"},
+			{"ctrl+p ctrl+x", "details: favorite (to the top) / hide (to the bottom)"},
+			{"O C", "details: expand all / collapse all"},
 			{"i", "details: toggle help for the selected field"},
+		}},
+		{"Logs", [][2]string{
+			{"L", "show the selected pod's log (again or esc to close)"},
+			{"p", "previous container's log (on a pod, or toggle in the log)"},
+			{"enter", "show the selected line as a tree (JSON / ECS fields)"},
+			{"ctrl+p", "in the entry: pin the field to every log line"},
+			{"s G", "toggle autoscroll / jump to the end and follow"},
+			{"f", "fullscreen"},
+			{"c", "next container"},
+		}},
+		{"Events and describe", [][2]string{
+			{"E", "events of the selected object, newest first (again or esc to close)"},
+			{"d", "describe: owners, pods, services, uses / used by, events"},
+			{"enter d E", "on a related object: go to its list / describe it / its events"},
+			{"⚠N", "table: N warning events in the last hour (click it for the events)"},
 		}},
 		{"Mouse", [][2]string{
 			{"click", "select, focus a panel, toggle ▸ ▾"},
@@ -1094,15 +1522,41 @@ func helpView() string {
 			{"click ☆ / ×", "pin where you are / unpin"},
 		}},
 	}
-	var lines []string
-	for i, s := range sections {
-		if i > 0 {
-			lines = append(lines, "")
+	render := func(secs []helpSection) []string {
+		var lines []string
+		for i, s := range secs {
+			if i > 0 {
+				lines = append(lines, "")
+			}
+			lines = append(lines, " "+stAccent.Bold(true).Render(s.title))
+			for _, k := range s.keys {
+				lines = append(lines, "  "+stKey.Render(fit(k[0], 18))+" "+k[1])
+			}
 		}
-		lines = append(lines, " "+stAccent.Bold(true).Render(s.title))
-		for _, k := range s.keys {
-			lines = append(lines, "  "+stKey.Render(fit(k[0], 18))+" "+k[1])
-		}
+		return lines
 	}
-	return frame("Help", "any key to close", lines, 74, len(lines)+2, true)
+	const colW = 80
+	lines := render(sections)
+	if len(lines)+2 <= h || w < 2*colW+2 {
+		return frame("Help", "any key to close", lines, 76, len(lines)+2, true)
+	}
+	// Two columns when one does not fit the screen.
+	left, right := render(sections[:2]), render(sections[2:])
+	lines = lines[:0]
+	for i := range max(len(left), len(right)) {
+		var l, r string
+		if i < len(left) {
+			l = left[i]
+		}
+		if i < len(right) {
+			r = right[i]
+		}
+		lines = append(lines, fit(l, colW)+r)
+	}
+	return frame("Help", "any key to close", lines, 2*colW+2, len(lines)+2, true)
+}
+
+type helpSection struct {
+	title string
+	keys  [][2]string
 }

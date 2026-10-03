@@ -13,8 +13,9 @@ import (
 )
 
 type tableRow struct {
-	cells []string
-	obj   *unstructured.Unstructured
+	cells    []string
+	obj      *unstructured.Unstructured
+	warnings int // recent Warning events about obj
 }
 
 type tableView struct {
@@ -35,6 +36,10 @@ type tableView struct {
 	sortDesc bool
 	filter   string
 
+	// warnings marks rows with recent Warning events (⚠ in the NAME
+	// column). Not used for the events list itself.
+	warnings *k8s.WarningIndex
+
 	selUID string // keeps the selection on the same object across refreshes
 	widths []int  // last rendered column widths; 0 means hidden
 	colX   []int  // start x of each visible column, for header clicks
@@ -51,6 +56,10 @@ func (t *tableView) SetResource(key k8s.Key, res k8s.Resource) {
 		t.cols = append([]k8s.Column{k8s.ColNamespace}, t.cols...)
 	}
 	t.sortCol, t.sortDesc = 0, false
+	if i := slices.IndexFunc(t.cols, func(c k8s.Column) bool { return c.DefaultSort }); i >= 0 {
+		t.sortCol = i
+	}
+	t.warnings = nil
 	t.cursor, t.offset, t.selUID = 0, 0, ""
 	t.widths = nil
 	t.filter = ""
@@ -61,6 +70,18 @@ func (t *tableView) SetResource(key k8s.Key, res k8s.Resource) {
 
 func (t *tableView) SetEntry(e k8s.Entry) {
 	t.entry, t.hasData = e, true
+	t.rebuild()
+}
+
+// Select moves the cursor to the object with uid, now or once it is listed.
+func (t *tableView) Select(uid string) {
+	t.selUID = uid
+	t.rebuild()
+}
+
+// SetWarnings marks the rows with recent Warning events.
+func (t *tableView) SetWarnings(ix k8s.WarningIndex) {
+	t.warnings = &ix
 	t.rebuild()
 }
 
@@ -98,7 +119,11 @@ func (t *tableView) rebuild() {
 				continue
 			}
 		}
-		t.rows = append(t.rows, tableRow{cells: cells, obj: obj})
+		row := tableRow{cells: cells, obj: obj}
+		if t.warnings != nil {
+			row.warnings = t.warnings.Count(obj)
+		}
+		t.rows = append(t.rows, row)
 	}
 	t.sortRows()
 	t.cursor = clamp(t.cursor, 0, len(t.rows)-1)
@@ -185,6 +210,10 @@ func (t *tableView) Update(msg tea.Msg) tea.Cmd {
 		i := t.offset + msg.y - 1
 		if i >= 0 && i < len(t.rows) {
 			t.cursor = i
+			if t.onMarker(t.rows[i], msg.x) {
+				t.remember()
+				return emit(openEventsMsg{})
+			}
 			if msg.double {
 				t.remember()
 				return emit(openDetailMsg{})
@@ -215,7 +244,40 @@ func (t *tableView) nextVisibleCol(c int) int {
 	return c
 }
 
-type openDetailMsg struct{}
+type (
+	openDetailMsg struct{}
+	// openEventsMsg asks to show the events of the selected object.
+	openEventsMsg struct{}
+)
+
+// warningMark is the ⚠ marker of a row with n warnings, drawn at the right
+// end of the NAME column.
+func warningMark(n int) string {
+	if n == 0 {
+		return ""
+	}
+	return fmt.Sprintf(" ⚠%d", n)
+}
+
+// nameCol returns the index of the column that carries the warning marker.
+func (t *tableView) nameCol() int {
+	return slices.IndexFunc(t.cols, func(c k8s.Column) bool { return c.Name == "NAME" })
+}
+
+// onMarker reports whether x (panel-local) is on the row's warning marker.
+func (t *tableView) onMarker(r tableRow, x int) bool {
+	nc := t.nameCol()
+	if r.warnings == 0 || nc < 0 || nc >= len(t.widths) || t.widths[nc] == 0 {
+		return false
+	}
+	for i, ci := range t.colIdx {
+		if ci == nc {
+			end := t.colX[i] + t.widths[nc]
+			return x >= end-ansi.StringWidth(warningMark(r.warnings)) && x < end
+		}
+	}
+	return false
+}
 
 func (t *tableView) title() string {
 	scope := t.key.Namespace
@@ -280,13 +342,20 @@ func (t *tableView) columnWidths(avail int) []int {
 	for i, c := range t.cols {
 		natural[i] = len(c.Name) + 1 // room for the sort arrow
 	}
+	nc := t.nameCol()
 	for _, r := range t.rows {
 		for i, c := range r.cells {
-			natural[i] = max(natural[i], ansi.StringWidth(c))
+			w := ansi.StringWidth(c)
+			if i == nc {
+				w += ansi.StringWidth(warningMark(r.warnings))
+			}
+			natural[i] = max(natural[i], w)
 		}
 	}
-	for i := range natural {
-		natural[i] = min(natural[i], 60)
+	for i, c := range t.cols {
+		if !c.Flex {
+			natural[i] = min(natural[i], 60)
+		}
 	}
 	t.widths = layoutColumns(t.cols, natural, avail, t.sortCol)
 	return t.widths
@@ -310,6 +379,9 @@ func layoutColumns(cols []k8s.Column, natural []int, avail, keep int) []int {
 		return total + max(n-1, 0)*colGap - avail
 	}
 	nameCol := slices.IndexFunc(cols, func(c k8s.Column) bool { return c.Name == "NAME" })
+	if nameCol < 0 {
+		nameCol = slices.IndexFunc(cols, func(c k8s.Column) bool { return c.Flex })
+	}
 	shrinkName := func(floor int) {
 		if o := over(); o > 0 && nameCol >= 0 {
 			w[nameCol] = max(w[nameCol]-o, min(natural[nameCol], floor))
@@ -337,6 +409,12 @@ func layoutColumns(cols []k8s.Column, natural []int, avail, keep int) []int {
 	for i := len(w) - 1; i >= 0 && over() > 0; i-- {
 		if i != nameCol && i != keep {
 			w[i] = 0
+		}
+	}
+	// A flex column takes back the room that hiding columns left over.
+	if nameCol >= 0 && cols[nameCol].Flex {
+		if o := over(); o < 0 {
+			w[nameCol] = min(w[nameCol]-o, natural[nameCol])
 		}
 	}
 	return w
@@ -373,13 +451,27 @@ func joinCells(cells []string) string {
 
 func (t *tableView) renderRow(r tableRow, widths []int, selected bool, iw int) string {
 	var cells []string
+	warn := t.res.Name == "events" && k8s.IsWarning(r.obj)
+	nc := t.nameCol()
 	for i, c := range r.cells {
 		if widths[i] == 0 {
+			continue
+		}
+		if mark := warningMark(r.warnings); i == nc && mark != "" {
+			mw := ansi.StringWidth(mark)
+			if selected {
+				cells = append(cells, fit(c, widths[i]-mw)+mark)
+			} else {
+				cells = append(cells, fit(c, widths[i]-mw)+stErr.Render(mark))
+			}
 			continue
 		}
 		cell := fit(c, widths[i])
 		if !selected { // the selection is drawn with one uniform highlight
 			cell = cellStyle(t.cols[i].Name, c, cell)
+			if warn && (t.cols[i].Name == "TYPE" || t.cols[i].Name == "REASON") {
+				cell = stErr.Render(cell)
+			}
 		}
 		cells = append(cells, cell)
 	}
@@ -398,7 +490,7 @@ func cellStyle(col, raw, cell string) string {
 	switch col {
 	case "STATUS":
 		return statusStyle(raw).Render(cell)
-	case "NAMESPACE", "AGE":
+	case "NAMESPACE", "AGE", "LAST SEEN":
 		return stMuted.Render(cell)
 	case "RESTARTS":
 		if raw != "0" {

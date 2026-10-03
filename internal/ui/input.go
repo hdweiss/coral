@@ -10,7 +10,14 @@ type (
 		double bool
 	}
 	wheelMsg struct{ delta int }
+	// focusMsg asks the app to move focus, e.g. when h/l run past the edge
+	// of a panel.
+	focusMsg struct{ f focusID }
 )
+
+// plainKey and ctrlKey build key presses, for buttons that act like keys.
+func plainKey(r rune) tea.KeyPressMsg { return tea.KeyPressMsg{Code: r, Text: string(r)} }
+func ctrlKey(r rune) tea.KeyPressMsg  { return tea.KeyPressMsg{Code: r, Mod: tea.ModCtrl} }
 
 func emit(msg tea.Msg) tea.Cmd { return func() tea.Msg { return msg } }
 
@@ -26,10 +33,6 @@ func moveCursor(key string, cursor, n, page int) (int, bool) {
 		cursor -= max(page-1, 1)
 	case "pgdown", "ctrl+f":
 		cursor += max(page-1, 1)
-	case "ctrl+u":
-		cursor -= max(page/2, 1)
-	case "ctrl+d":
-		cursor += max(page/2, 1)
 	case "home", "g":
 		cursor = 0
 	case "end", "G":

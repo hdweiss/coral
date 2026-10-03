@@ -16,7 +16,7 @@ import (
 // Editing an object goes: fetch it fresh → write it to a temp file → run
 // $EDITOR → read it back → update on the server. When the server or the YAML
 // parser rejects it, the editor opens again with the error on top, like
-// kubectl edit. Adding a field ("a") runs the same flow with the field
+// kubectl edit. Adding a field (ctrl+n) runs the same flow with the field
 // inserted and the cursor on it.
 
 type (
@@ -56,10 +56,21 @@ type addTarget struct {
 	path string // for display, e.g. .spec.template
 }
 
+// selection is the object that e and ctrl+n act on, and the list it is in:
+// the table's selected row, or the selected row of the events or describe
+// view.
+func (a *App) selection() (k8s.Key, *unstructured.Unstructured) {
+	if a.desc != nil {
+		key, obj, _ := a.desc.selectionKey()
+		return key, obj
+	}
+	return a.cur, a.table.Selected()
+}
+
 // startEdit opens the selected object in the editor, with the cursor on
 // focus when it is given.
 func (a *App) startEdit(focus []yamltree.Seg) tea.Cmd {
-	obj := a.table.Selected()
+	key, obj := a.selection()
 	if obj == nil {
 		a.setFlash("nothing selected to edit", true)
 		return nil
@@ -67,7 +78,7 @@ func (a *App) startEdit(focus []yamltree.Seg) tea.Cmd {
 	if a.editing != nil {
 		return nil
 	}
-	return a.fetchForEdit(a.cur, obj, "", func(fresh *unstructured.Unstructured) (map[string]any, []yamltree.Seg, error) {
+	return a.fetchForEdit(key, obj, "", func(fresh *unstructured.Unstructured) (map[string]any, []yamltree.Seg, error) {
 		return fresh.DeepCopy().Object, focus, nil
 	})
 }
@@ -165,6 +176,9 @@ func (a *App) onUpdated(msg updatedMsg) tea.Cmd {
 	}
 	key := a.editing.key
 	a.stopEditing("updated "+a.editing.desc, false)
+	if a.desc != nil {
+		return tea.Batch(a.fetch(key), a.desc.load(a.store, 0, 0))
+	}
 	return a.fetch(key)
 }
 
@@ -188,12 +202,12 @@ func (a *App) schemaSource(ctx string) schema.Source {
 // startAdd opens the "add field" dialog below the selected node of the
 // detail view, or at the top level of the object from the table.
 func (a *App) startAdd() tea.Cmd {
-	obj := a.table.Selected()
+	key, obj := a.selection()
 	if obj == nil {
 		a.setFlash("nothing selected", true)
 		return nil
 	}
-	t := addTarget{key: a.cur, obj: obj}
+	t := addTarget{key: key, obj: obj}
 	if a.focus == focusDetail {
 		if n := addParent(a.detail.current()); n != nil {
 			t.segs, t.path = n.Segments(), n.Path

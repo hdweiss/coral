@@ -125,3 +125,32 @@ func TestArrange(t *testing.T) {
 		t.Fatal("collapse all should leave hidden groups alone")
 	}
 }
+
+func TestLookupPattern(t *testing.T) {
+	obj := map[string]any{
+		"@timestamp": "t",
+		"http":       map[string]any{"response": map[string]any{"status_code": int64(200)}},
+		"spans":      []any{map[string]any{"x": 1}, map[string]any{"id": "b"}},
+	}
+	n := Build(obj).Find(`.http.response.status_code`)
+	if n == nil {
+		t.Fatal("node not found")
+	}
+	for pattern, want := range map[string]any{
+		n.Pattern():      int64(200),
+		`["@timestamp"]`: "t",
+		`.spans[].id`:    "b",
+		`.spans[0].x`:    1,
+	} {
+		got, ok := Lookup(obj, pattern)
+		if !ok || got != want {
+			t.Errorf("Lookup(%s) = %v, %v; want %v", pattern, got, ok, want)
+		}
+	}
+	if _, ok := Lookup(obj, ".http.nope"); ok {
+		t.Error("missing field found")
+	}
+	if got := PatternLabel(`.spans[].id`); got != "spans.id" {
+		t.Errorf("PatternLabel = %s", got)
+	}
+}
