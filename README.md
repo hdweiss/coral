@@ -50,3 +50,7 @@ make check   # gofmt, go vet and tests
 ```
 
 Design notes and status are in [docs/status.md](docs/status.md), and the roadmap is in [docs/plan.md](docs/plan.md).
+
+## License
+
+MIT — see [LICENSE](LICENSE).
