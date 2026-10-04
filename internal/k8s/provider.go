@@ -4,10 +4,13 @@ import (
 	"context"
 	"errors"
 	"io"
+	"path/filepath"
 	"sort"
 	"sync"
+	"time"
 
 	"k8s.io/client-go/discovery"
+	"k8s.io/client-go/discovery/cached/disk"
 	"k8s.io/client-go/dynamic"
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/openapi"
@@ -33,6 +36,7 @@ type Provider interface {
 type kubeProvider struct {
 	rules *clientcmd.ClientConfigLoadingRules
 	raw   *clientcmdapi.Config
+	opts  KubeOptions
 
 	mu      sync.Mutex
 	configs map[string]*rest.Config
@@ -41,12 +45,20 @@ type kubeProvider struct {
 	typed   map[string]kubernetes.Interface
 }
 
-// NewKubeProvider loads the kubeconfig from path, or from the default
-// locations ($KUBECONFIG, ~/.kube/config) when path is empty.
-func NewKubeProvider(path string) (Provider, error) {
+// KubeOptions configure the clients of real clusters.
+type KubeOptions struct {
+	Kubeconfig string  // "" loads $KUBECONFIG or ~/.kube/config
+	Trace      *Tracer // logs every request when set
+	// CacheDir keeps OpenAPI documents on disk, per context (see
+	// CacheDir), like kubectl's ~/.kube/cache. "" keeps them in memory.
+	CacheDir string
+}
+
+// NewKubeProvider loads the kubeconfig.
+func NewKubeProvider(opts KubeOptions) (Provider, error) {
 	rules := clientcmd.NewDefaultClientConfigLoadingRules()
-	if path != "" {
-		rules.ExplicitPath = path
+	if opts.Kubeconfig != "" {
+		rules.ExplicitPath = opts.Kubeconfig
 	}
 	raw, err := rules.Load()
 	if err != nil {
@@ -56,7 +68,7 @@ func NewKubeProvider(path string) (Provider, error) {
 		return nil, errors.New("no contexts found in kubeconfig (try --demo)")
 	}
 	return &kubeProvider{
-		rules: rules, raw: raw,
+		rules: rules, raw: raw, opts: opts,
 		configs: map[string]*rest.Config{},
 		clients: map[string]dynamic.Interface{},
 		openapi: map[string]openapi.Client{},
@@ -100,6 +112,9 @@ func (p *kubeProvider) config(context string) (*rest.Config, error) {
 	rc.QPS, rc.Burst = 50, 100
 	// Warnings would be printed on top of the TUI.
 	rc.WarningHandler = rest.NoWarnings{}
+	if p.opts.Trace != nil {
+		rc.Wrap(p.opts.Trace.WrapTransport)
+	}
 	p.configs[context] = rc
 	return rc, nil
 }
@@ -132,7 +147,16 @@ func (p *kubeProvider) OpenAPI(context string) (openapi.Client, error) {
 	if err != nil {
 		return nil, err
 	}
-	dc, err := discovery.NewDiscoveryClientForConfig(rc)
+	var dc discovery.DiscoveryInterface
+	if p.opts.CacheDir != "" {
+		// The documents' paths carry a hash and the server marks them
+		// immutable, so the HTTP cache serves them from disk until the
+		// index (revalidated by ETag) points elsewhere.
+		dir := CacheDir(p.opts.CacheDir, context)
+		dc, err = disk.NewCachedDiscoveryClientForConfig(rc, filepath.Join(dir, "discovery"), filepath.Join(dir, "http"), 6*time.Hour)
+	} else {
+		dc, err = discovery.NewDiscoveryClientForConfig(rc)
+	}
 	if err != nil {
 		return nil, err
 	}
@@ -165,4 +189,22 @@ func (p *kubeProvider) Logs(ctx context.Context, context string, req LogRequest)
 		return nil, err
 	}
 	return c.CoreV1().Pods(req.Namespace).GetLogs(req.Pod, req.options()).Stream(ctx)
+}
+
+// CacheDir is a context's directory under the cache directory base. Context
+// names may hold characters that paths can't, such as the slashes and colons
+// of EKS ARNs; those become _, plus a hash so that names stay apart.
+func CacheDir(base, context string) string {
+	safe := []byte(context)
+	changed := false
+	for i, c := range safe {
+		if !(c >= 'a' && c <= 'z' || c >= 'A' && c <= 'Z' || c >= '0' && c <= '9' || c == '-' || c == '.' || c == '_') || i == 0 && c == '.' {
+			safe[i], changed = '_', true
+		}
+	}
+	name := string(safe)
+	if changed {
+		name += "-" + hash(context, 8)
+	}
+	return filepath.Join(base, name)
 }

@@ -1,22 +1,28 @@
 # Status
 
-Handoff notes for picking the work back up. Last updated 2026-10-03 (second session).
+Handoff notes for picking the work back up. Last updated 2026-10-04 (network traffic and custom resources).
 
 ## What exists
 
 A first working version of coralctl in Go with Bubble Tea v2 (`charm.land/bubbletea/v2`), Lip Gloss v2 and Bubbles v2. k9s is the template for features and UX only. Its code is built on tview, so none of it is reused.
 
 ```
-cmd/coral/main.go         cobra root (TUI) + `version`; flags --demo --context -n -A --refresh --timeout --theme
+cmd/coral/main.go         cobra root (TUI) + `version`; flags --demo --context -n -A --refresh --timeout --theme --trace-api
 internal/k8s/             data layer
-  resources.go            built-in resource registry: aliases, GVR, nav category
+  resources.go            built-in resource registry: aliases, GVR, nav category; Resource.ID()
+  crd.go                  CRD parsing into custom Resources, group → category map, per-context Registry (lookup, groups)
+  printer.go              columns from additionalPrinterColumns (JSONPath), CRDs list columns
   columns.go              per-kind table columns (pods, deploy, svc, …) + generic fallback
-  store.go                cache of list results keyed by (context, GVR, namespace)
-  provider.go             kubeconfig → dynamic client per context
+  store.go                cache of list results keyed by (context, GVR, namespace, field selector); in-flight dedupe; Registry per context
+  diskcache.go            CRD lists on disk (os.UserCacheDir()/coral/<context>/crds.json)
+  trace.go                --trace-api: request log via WrapTransport (real) or a reactor (demo)
+  provider.go             kubeconfig → dynamic client per context; OpenAPI through client-go's disk HTTP cache
   logs.go                 LogRequest, pod container order (default-container annotation)
   events.go               event time/count, matching events to objects, Warning index for the ⚠ markers, events columns
   related.go              related objects for describe: owners, selected pods, services, policies, uses / used by
+  related_crds.go         relations of cert-manager, Cilium, Linkerd and Gateway API objects, both ways
   demo.go                 fake dynamic client with two realistic clusters (--demo)
+  demo_crds.go            demo CRDs and instances: cert-manager, Prometheus operator (dev only), Gateway API, Cilium, Linkerd
   demo_logs.go            generated demo logs: ECS JSON, zap JSON, nginx/redis/logfmt text, klog
 internal/config/          persisted user state: pins.json, fields.json
 internal/schema/          field schemas: cluster OpenAPI v3 (incl. CRDs) with fallback to k8s.io/api Go types + SwaggerDoc
@@ -41,7 +47,9 @@ internal/ui/              TUI
 
 Run it with `make demo` (`make build`, `make test`, `make check` and `make install` also exist). There is no real cluster in the dev environment, so test with `--demo`. tmux is installed; `tmux new -d -s coral -x 160 -y 40 ./bin/coral --demo` plus `tmux capture-pane -p` works for checking the screen.
 
-Tests: `go test ./...` (demo store lists every builtin; events and warning counts; relations on the demo cluster; yamltree ordering and folding; table column layout).
+Tests: `go test ./...` (demo store lists every builtin and custom resource; events and warning counts; relations on the demo cluster; store dedupe, update and disk cache; CRD parsing, printer columns, registry lookup; navigator Custom Resources folders and pins; refresh pausing; yamltree ordering and folding; table column layout).
+
+`--trace-api <file>` logs every request (in demo mode: verb, resource, namespace, field selector). Use it to check what a change costs in requests.
 
 Set `XDG_CONFIG_HOME` to a temp dir when testing so pins don't touch the real config.
 
@@ -54,12 +62,19 @@ Mouse can be scripted in tmux by sending SGR sequences as literal keys, for exam
 - **Keys follow k9s** where coral has the same feature and it doesn't clash with `h`/`l` panel movement: `0` all namespaces, `1`–`9` open pins (numbered in the navigator, in pin order), `y` YAML details, `p` previous logs, `s`/`f` autoscroll/fullscreen in the log view, `ctrl+r` refresh (`r` too). Coral-only actions moved to ctrl keys to keep k9s's letters free: `ctrl+p` pin/favorite, `ctrl+n` add field, `ctrl+x` hide field. Deliberate differences: `L` logs (k9s `l`, which is "right" here), `s`/`S` sort in the table (k9s sorts with shift+column letter; `s` will need to move when shell lands), and `ctrl+d`/`ctrl+u` no longer page so `ctrl+d` is free for delete. `d` is describe and `E` events (k9s has no `E`; its events are a resource view). `a`, `x` (outside the details), `space` in the table and `ctrl+k` are kept free for attach, Secret decode, marking and kill.
 
 - **Cache first:** views render from the Store immediately. They refetch if the data is older than 5s, and the visible list refreshes in the background every `--refresh`. `r` refreshes now.
-- **Client-side columns** (not server-side Table), so demo mode and CRDs share one code path. Server-side tables could be added later for CRD printer columns.
+- **Network traffic** ([network.md](network.md), items 1–5 and 7–12 done, 6 (watches) open):
+  - Moving the navigator cursor only highlights; `enter`, `l`/right or a click opens the list.
+  - The tick refreshes nothing while the terminal is unfocused (`View.ReportFocus`, `tea.FocusMsg`/`BlurMsg`), nor a list covered by logs or describe; `App.refreshDue` catches up on the next tick or on focus.
+  - Lists use `ResourceVersion: "0"` (watch cache). Since that can lag a write, `Store.Update` puts the updated object into every cached list of its resource, and an edit no longer relists.
+  - `Store.Fetch` shares a request in flight per key; `Store.Cached` is get-or-fetch with a max age.
+  - Namespaces and CRDs are fetched only for contexts expanded in the navigator (and CRDs for contexts with custom resource pins).
+  - Describe refreshes only its events on the tick; relations on `r` or reopening.
+- **Client-side columns** (not server-side Table), so demo mode and CRDs share one code path. Custom resources get theirs from `additionalPrinterColumns` (`printer.go`, `k8s.io/client-go/util/jsonpath`, first result like the API server; `date` as age or "in 3d", `integer`/`number` sort numerically, `priority` → `Column.Drop`).
 - **Mouse hit-testing** uses the layout rects in `App.layout`, not bubblezone. Panels get panel-local `clickMsg`/`wheelMsg`. The header and status bar register `button`s while rendering.
 - Double-click is detected in `App.handleMouse` (400ms, same cell).
 - Below 100 columns the detail panel replaces the table instead of sitting next to it.
 - **Column fitting** (`layoutColumns` in table.go): NAME shrinks to 24, then columns with `Column.Drop > 0` are hidden (highest first: pods IP then NODE, svc CLUSTER-IP, pvc VOLUME/STORAGECLASS, …). Then NAME shrinks to 12, and finally columns are hidden from the right. NAME and the sort column are never hidden. `s` skips hidden columns.
-- **Pins** are `config.Pin{Context, Namespace, Resource}`: Namespace "" means the whole cluster, and Resource (a `k8s.Resource` name like `pods`) pins one list (a namespaced Resource without Namespace is the all-namespaces list). They are stored in `os.UserConfigDir()/coral/pins.json`, or `pins-demo.json` with `--demo`, and saved on every change. Ways to pin:
+- **Pins** are `config.Pin{Context, Namespace, Resource}`: Namespace "" means the whole cluster, and Resource (`k8s.Resource.ID()`: the plural like `pods`, or `plural.group` for custom resources) pins one list (a namespaced Resource without Namespace is the all-namespaces list). They are stored in `os.UserConfigDir()/coral/pins.json`, or `pins-demo.json` with `--demo`, and saved on every change. Ways to pin:
   - `ctrl+p` in the navigator pins the resource list under the cursor, otherwise the node's namespace, or its cluster outside a namespace. On a pin, `ctrl+p`/delete/backspace unpins it. `ctrl+p` in the table pins where you are, like the header ☆.
   - Click the ☆/★ after the breadcrumb.
   - `:pin` pins the current namespace, or the cluster when the view is all-namespaces or cluster-scoped.
@@ -91,11 +106,16 @@ Mouse can be scripted in tmux by sending SGR sequences as literal keys, for exam
   - The entry view keeps folding and the cursor's field when moving between lines. Top-level keys `@timestamp`, `log`, `message` (and non-ECS equivalents) come first (`yamltree.BuildFirst`). Tabs are expanded when rendering (`untab`).
 - **Events** are core `v1` (its `involvedObject` is simpler to match than `regarding` in `events.k8s.io/v1`). `k8s.About` matches an event to an object by kind, namespace, name and uid; a uid equal to the name also matches, since the kubelet sets that on node events (which live in `default`).
   - The `events` resource has `Category: CatTop`, so the navigator puts it directly under each namespace and All namespaces, after the categories. The table sorts it by LAST SEEN (`Column.DefaultSort`), newest first; TYPE and REASON are red for warnings. MESSAGE is `Column.Flex`: it shrinks first (there's no NAME) and takes back the room left when columns are hidden. TYPE then COUNT are hidden first.
-  - **⚠ markers:** with every list the app also fetches the events that cover it (`k8s.EventsKey`: the same namespace, or all namespaces for a cluster-scoped list) and refreshes them with it. `k8s.IndexWarnings` counts Warning events of the last hour (`WarningWindow`) per uid, or per kind/namespace/name for events without a real uid, so a recreated pod with the same name doesn't inherit the old one's warnings. The count is drawn in red at the right end of the NAME cell (`warningMark`), so it sits at a fixed x; a click there opens the events.
-- **Events (`E`) and describe (`d`)** replace the table like the log view (`describeView`, `App.desc`). `E` lists the selected object's events (a cluster-scoped object's from all namespaces), filtered client-side from the cached namespace list. `d` shows `k8s.Relations` by section (Owners, Node, ReplicaSets/Jobs/Pods, Services, Network policies, Autoscalers, Uses, Used by, Ingresses, …), then the events.
+  - **⚠ markers:** with every list the app also fetches the Warning events that cover it (`k8s.WarningsKey`: `fieldSelector=type=Warning` in the same namespace; for Nodes `involvedObject.kind=Node` in all namespaces; other cluster-scoped lists have no markers) and refreshes them with it. The demo's fake client ignores field selectors, so the client-side filters stay. `k8s.IndexWarnings` counts Warning events of the last hour (`WarningWindow`) per uid, or per kind/namespace/name for events without a real uid, so a recreated pod with the same name doesn't inherit the old one's warnings. The count is drawn in red at the right end of the NAME cell (`warningMark`), so it sits at a fixed x; a click there opens the events.
+- **Events (`E`) and describe (`d`)** replace the table like the log view (`describeView`, `App.desc`). `E` lists the selected object's events (a cluster-scoped object's from all namespaces), listed with `fieldSelector=involvedObject.kind=…,involvedObject.name=…` (`k8s.EventsKey`) and filtered client-side by `k8s.EventsAbout`, which also drops earlier objects of the same name. `d` shows `k8s.Relations` by section (Owners, Node, ReplicaSets/Jobs/Pods, Services, Network policies, Autoscalers, Uses, Used by, Ingresses, …), then the events.
   - Relations are computed in a goroutine through `Store.Lister`, which serves lists from the cache when fresh and fetches them otherwise. Rows note how they relate (`volume`, `envFrom`, a pod's status); references to missing objects show in red as "not found". Pods are matched by label selector (`metav1.LabelSelectorAsSelector`), so a deployment's pods are found without walking ReplicaSets. "Used by" lists pod templates of workloads and only standalone pods, not each pod of a deployment.
+  - The describe view starts with the object itself (`descRow.self`, marked ▶ in the accent color, with `k8s.SummaryOf`), shown before the rest loads and kept by filters; `enter` on it goes to it in its list, `d` on it goes back.
   - The cursor skips section headers. The detail panel shows the selected row's object (an event or a related object), so `e`, `ctrl+n` and `i` work on it (`App.selection`). `enter` jumps to a related object in its list, staying in all namespaces if that's where you were, and `tableView.Select` puts the cursor on it. `d`/`E` on a related row open its view on top (`describeView.prev`); `esc` (or the same key elsewhere) goes back one level. `L`/`p` open the log of the selected or described pod.
-  - Refresh: on the `--refresh` tick events are refetched and relations reused for up to 30s; `r` refetches everything.
+  - Refresh: on the `--refresh` tick only the events are refetched; relations are recomputed on `r` or when the view is reopened.
+- **Custom resources** ([crds.md](crds.md)): a context's CRD list (`k8s.CRDKey`) is fetched when the context is expanded, kept for `k8s.CRDMaxAge` (10 minutes, in memory and on disk via `Store.SetCacheDir`; not in demo mode) and not refreshed on the tick; `r` in the CRDs list relists it. `Store.Registry(ctx)` turns it into a `k8s.Registry` (memoized per fetch): builtins first, then custom resources by `plural.group`, and by plural, short name, singular or kind when unambiguous. Every UI lookup that can see a custom resource (`:`, pins, `resourceIn` for context switches) goes through it; `k8s.Lookup` remains for builtins-only callers.
+  - Navigator: `navView.SetCustom` rebuilds a context's category nodes when its CRDs arrive (`rebuild`/`keepFolds` keep fold state by `nodeID`, `keepCursor` the cursor by path). Groups in `groupCategories` go flat into a builtin category (cluster-scoped ones into Cluster); the rest into Custom Resources › group, under each namespace, All namespaces and Cluster. A failed CRD list shows an error row under Cluster › Custom Resources. Resource pins of custom resources appear once their context's CRDs are known.
+  - `o` (or double-click) in the CRDs list opens the selected CRD's instances. Relations resolve owners and event objects through `Registry.ForKind`, so a secret owned by a Certificate shows it.
+  - Relations of well-known CRDs (`related_crds.go`), looked for only when the context has the CRD: Certificate ↔ Secret and Issuer/ClusterIssuer, Ingress/Gateway → Certificates; Cilium (clusterwide) network policies ↔ pods and workloads, with `k8s:`/`any:` key prefixes stripped, the namespace and service account labels Cilium adds, and `reserved:` selectors matching no pod; Linkerd Server ↔ pods, ServiceProfile ↔ Service (by the profile's FQDN name); Gateway ↔ HTTPRoute → Services. An object already listed (e.g. as owner) isn't repeated. Describing a custom object picks its relations by `Resource.ID()`, not kind, since kinds clash across groups.
   - Demo: `demo.event` seeds events per pod state (CrashLoopBackOff: BackOff, Unhealthy; ImagePullBackOff: Failed, ErrImagePull; Pending: FailedScheduling), the NotReady node, a recent deployment rollout and the CronJob/Job.
 - **Help** switches to two columns when one is taller than the screen and the screen is wide enough.
 - **Demo updates:** a reactor in `demo.go` gives the fake client real-server semantics. Updates bump resourceVersion, and a stale version is a Conflict.

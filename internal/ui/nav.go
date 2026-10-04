@@ -89,31 +89,147 @@ func newNavView(store *k8s.Store) *navView {
 
 func newContextNode(ctx string) *navNode {
 	n := &navNode{kind: nkContext, label: ctx, context: ctx}
-	fillContext(n)
+	fillContext(n, nil)
 	return n
 }
 
-// fillContext adds the children of a context node.
-func fillContext(n *navNode) {
-	cluster := n.add(&navNode{kind: nkCategory, label: k8s.CatCluster})
-	for _, r := range k8s.InCategory(k8s.CatCluster) {
-		cluster.add(&navNode{kind: nkResource, label: r.Title, res: r})
-	}
-	addCategories(n.add(&navNode{kind: nkAllNS, label: "All namespaces"}))
+// fillContext adds the children of a context node. reg has the context's
+// custom resources, once its CRDs are listed.
+func fillContext(n *navNode, reg *k8s.Registry) {
+	fillCluster(n.add(&navNode{kind: nkCategory, label: k8s.CatCluster}), reg)
+	addCategories(n.add(&navNode{kind: nkAllNS, label: "All namespaces"}), reg)
 	n.add(&navNode{kind: nkInfo, label: "loading namespaces…"})
 }
 
-func addCategories(n *navNode) {
+// fillCluster adds the cluster-scoped resources: the builtins and the custom
+// resources of mapped groups, then a Custom Resources folder.
+func fillCluster(n *navNode, reg *k8s.Registry) {
+	for _, r := range reg.InCategory(k8s.CatCluster) {
+		n.add(&navNode{kind: nkResource, label: r.Title, res: r})
+	}
+	addCustom(n, reg, false)
+}
+
+func addCategories(n *navNode, reg *k8s.Registry) {
 	for _, cat := range k8s.NamespacedCategories {
 		c := n.add(&navNode{kind: nkCategory, label: cat, ns: n.ns})
-		for _, r := range k8s.InCategory(cat) {
+		for _, r := range reg.InCategory(cat) {
 			c.add(&navNode{kind: nkResource, label: r.Title, res: r, ns: n.ns})
 		}
 		c.expanded = cat == k8s.CatWorkloads
 	}
+	addCustom(n, reg, true)
 	for _, r := range k8s.InCategory(k8s.CatTop) {
 		n.add(&navNode{kind: nkResource, label: r.Title, res: r, ns: n.ns})
 	}
+}
+
+// addCustom adds the Custom Resources folder with a folder per API group,
+// when there are any. Under Cluster it also says why listing the CRDs
+// failed.
+func addCustom(n *navNode, reg *k8s.Registry, namespaced bool) {
+	groups := reg.Groups(namespaced)
+	err := reg.Err()
+	if namespaced {
+		err = nil
+	}
+	if len(groups) == 0 && err == nil {
+		return
+	}
+	c := n.add(&navNode{kind: nkCategory, label: k8s.CatCustom, ns: n.ns})
+	if err != nil {
+		c.add(&navNode{kind: nkInfo, label: "error: " + err.Error(), err: true})
+	}
+	for _, g := range groups {
+		gn := c.add(&navNode{kind: nkCategory, label: g.Name, ns: n.ns})
+		for _, r := range g.Resources {
+			gn.add(&navNode{kind: nkResource, label: r.Title, res: r, ns: n.ns})
+		}
+	}
+}
+
+// SetCustom rebuilds the categories of a context after its CRDs were
+// listed, keeping fold state and the cursor.
+func (v *navView) SetCustom(ctx string) {
+	root := v.root(ctx)
+	if root == nil {
+		return
+	}
+	reg := v.store.Registry(ctx)
+	v.keepCursor(func() {
+		for _, c := range root.children {
+			switch c.kind {
+			case nkCategory: // Cluster
+				rebuild(c, func(n *navNode) { fillCluster(n, reg) })
+			case nkAllNS, nkNamespace:
+				rebuild(c, func(n *navNode) { addCategories(n, reg) })
+			}
+		}
+		for _, p := range v.pinned.children {
+			if p.context == ctx && p.kind == nkNamespace {
+				rebuild(p, func(n *navNode) { addCategories(n, reg) })
+			}
+		}
+		v.SetPins(v.pins) // resource pins of custom resources appear
+	})
+}
+
+// rebuild replaces n's children by what fill adds, carrying over the fold
+// state of the nodes that stay.
+func rebuild(n *navNode, fill func(*navNode)) {
+	old := n.children
+	n.children = nil
+	fill(n)
+	keepFolds(old, n.children)
+}
+
+func keepFolds(old, fresh []*navNode) {
+	for _, f := range fresh {
+		for _, o := range old {
+			if nodeID(o) == nodeID(f) {
+				f.expanded = o.expanded
+				keepFolds(o.children, f.children)
+				break
+			}
+		}
+	}
+}
+
+// nodeID tells a node from its siblings across rebuilds.
+func nodeID(n *navNode) string {
+	return fmt.Sprint(n.kind, "|", n.context, "|", n.label, "|", n.res.ID())
+}
+
+// keepCursor runs change, which may replace nodes, and puts the cursor back
+// on the node at the same path, or the closest ancestor that is left.
+func (v *navView) keepCursor(change func()) {
+	var path []string
+	if v.cursor >= 0 && v.cursor < len(v.lines) {
+		for n := v.lines[v.cursor]; n != nil; n = n.parent {
+			path = append(path, nodeID(n))
+		}
+	}
+	change()
+	v.refresh()
+	for k := range path {
+		for i, n := range v.lines {
+			if samePath(n, path[k:]) {
+				v.cursor = i
+				v.offset = scrollTo(v.cursor, v.offset, v.height())
+				return
+			}
+		}
+	}
+}
+
+func samePath(n *navNode, path []string) bool {
+	for _, id := range path {
+		if n == nil || nodeID(n) != id {
+			return false
+		}
+		n = n.parent
+	}
+	return n == nil
 }
 
 func (v *navView) root(ctx string) *navNode {
@@ -125,13 +241,19 @@ func (v *navView) root(ctx string) *navNode {
 	return nil
 }
 
+// expanded reports whether a context is unfolded in the navigator.
+func (v *navView) expanded(ctx string) bool {
+	r := v.root(ctx)
+	return r != nil && r.expanded
+}
+
 // SetNamespaces replaces a context's namespace nodes, keeping fold state.
 func (v *navView) SetNamespaces(ctx string, names []string, err error) {
 	root := v.root(ctx)
 	if root == nil {
 		return
 	}
-	setNamespaces(root, names, err)
+	setNamespaces(root, names, err, v.store.Registry(ctx))
 	v.loaded[ctx] = true
 	if p := v.pending; p != nil && p.key.Context == ctx {
 		v.pending = nil
@@ -140,7 +262,7 @@ func (v *navView) SetNamespaces(ctx string, names []string, err error) {
 	v.refresh()
 }
 
-func setNamespaces(root *navNode, names []string, err error) {
+func setNamespaces(root *navNode, names []string, err error, reg *k8s.Registry) {
 	old := map[string]*navNode{}
 	var kept []*navNode
 	for _, c := range root.children {
@@ -162,7 +284,7 @@ func setNamespaces(root *navNode, names []string, err error) {
 			continue
 		}
 		n := root.add(&navNode{kind: nkNamespace, label: ns, ns: ns})
-		addCategories(n)
+		addCategories(n, reg)
 	}
 }
 
@@ -182,7 +304,7 @@ func (v *navView) Reveal(key k8s.Key, res k8s.Resource) {
 		if target != nil {
 			return
 		}
-		if n.kind == nkResource && n.context == key.Context && n.res.Name == res.Name && (n.ns == key.Namespace || !res.Namespaced) {
+		if n.kind == nkResource && n.context == key.Context && n.res.ID() == res.ID() && (n.ns == key.Namespace || !res.Namespaced) {
 			target = n
 			return
 		}
@@ -288,7 +410,6 @@ func (v *navView) Update(msg tea.Msg) tea.Cmd {
 		switch msg.String() {
 		case "enter", "space":
 			if n.kind == nkResource {
-				// Moving onto it already shows the list; enter goes there.
 				return tea.Sequence(v.activate(n), emit(focusMsg{focusTable}))
 			}
 			return v.activate(n)
@@ -306,8 +427,8 @@ func (v *navView) Update(msg tea.Msg) tea.Cmd {
 			}
 			if n.expanded && len(n.children) > 0 {
 				v.cursor++
-			} else if n.kind == nkResource {
-				return emit(focusMsg{focusTable}) // a leaf: move on to its list
+			} else if n.kind == nkResource { // a leaf: open its list
+				return tea.Sequence(v.activate(n), emit(focusMsg{focusTable}))
 			}
 		case "left", "h":
 			if n.foldable() && n.expanded {
@@ -321,13 +442,10 @@ func (v *navView) Update(msg tea.Msg) tea.Cmd {
 				}
 			}
 		default:
+			// Moving only highlights: opening a list costs requests, so
+			// that waits for enter, l or a click.
 			if c, ok := moveCursor(msg.String(), v.cursor, len(v.lines), v.height()); ok {
 				v.cursor = c
-				// Moving onto a resource previews it, like a file browser.
-				if v.lines[c].kind == nkResource {
-					v.offset = scrollTo(v.cursor, v.offset, v.height())
-					return v.activate(v.lines[c])
-				}
 			}
 		}
 	case clickMsg:

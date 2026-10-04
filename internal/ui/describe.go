@@ -26,6 +26,7 @@ type descRow struct {
 	kind descRowKind
 	text string      // header title or info message
 	rel  k8s.Related // descObject
+	self bool        // the described object itself, on top
 	ev   *unstructured.Unstructured
 }
 
@@ -50,6 +51,7 @@ type describeView struct {
 
 	ctx        string
 	subject    *unstructured.Unstructured
+	res        k8s.Resource // subject's resource
 	eventsOnly bool
 	prev       *describeView // the view this one was opened from; esc returns to it
 
@@ -69,34 +71,38 @@ type describeView struct {
 }
 
 type describeMsg struct {
-	view   *describeView
-	gen    int
-	rels   []k8s.Relation
-	events []*unstructured.Unstructured
-	err    error
+	view     *describeView
+	gen      int
+	rels     []k8s.Relation
+	keepRels bool // only the events were loaded
+	events   []*unstructured.Unstructured
+	err      error
 }
 
-func newDescribeView(ctx string, subject *unstructured.Unstructured, eventsOnly bool) *describeView {
-	return &describeView{ctx: ctx, subject: subject, eventsOnly: eventsOnly}
+func newDescribeView(ctx string, subject *unstructured.Unstructured, res k8s.Resource, eventsOnly bool) *describeView {
+	v := &describeView{ctx: ctx, subject: subject, res: res, eventsOnly: eventsOnly}
+	v.rebuild() // the object shows while the rest loads
+	return v
 }
 
 // load computes the view's content in the background. Lists younger than
-// eventsAge (the events) and relAge (everything else) come from the cache.
-func (v *describeView) load(store *k8s.Store, eventsAge, relAge time.Duration) tea.Cmd {
+// maxAge come from the cache. Without withRels only the events are loaded
+// and the related objects stay as they are, since they rarely change.
+func (v *describeView) load(store *k8s.Store, maxAge time.Duration, withRels bool) tea.Cmd {
 	v.gen++
 	v.loading, v.at = true, time.Now()
-	gen, obj, eventsOnly := v.gen, v.subject, v.eventsOnly
-	events, rel := store.Lister(v.ctx, eventsAge), store.Lister(v.ctx, relAge)
+	gen, obj, ctx := v.gen, v.subject, v.ctx
+	withRels = withRels && !v.eventsOnly
+	rel, reg := store.Lister(ctx, maxAge), store.Registry(ctx)
 	return func() tea.Msg {
-		msg := describeMsg{view: v, gen: gen}
+		msg := describeMsg{view: v, gen: gen, keepRels: !withRels}
 		var relErr error
-		if !eventsOnly {
-			msg.rels, relErr = k8s.Relations(rel, obj)
+		if withRels {
+			msg.rels, relErr = k8s.Relations(rel, reg, obj)
 		}
-		// Events of cluster-scoped objects can be in any namespace.
-		items, err := events(k8s.MustLookup("events"), obj.GetNamespace())
-		msg.events = k8s.EventsAbout(items, obj)
-		msg.err = errors.Join(relErr, err)
+		e := store.Cached(k8s.EventsKey(ctx, obj), maxAge)
+		msg.events = k8s.EventsAbout(e.Items, obj)
+		msg.err = errors.Join(relErr, e.Err)
 		return msg
 	}
 }
@@ -106,7 +112,10 @@ func (v *describeView) onLoaded(msg describeMsg) {
 		return
 	}
 	v.loading, v.loaded = false, true
-	v.rels, v.events, v.err = msg.rels, msg.events, msg.err
+	if !msg.keepRels {
+		v.rels = msg.rels
+	}
+	v.events, v.err = msg.events, msg.err
 	v.rebuild()
 }
 
@@ -123,6 +132,14 @@ func (v *describeView) matches(text string) bool {
 func (v *describeView) rebuild() {
 	v.rows = v.rows[:0]
 	if !v.eventsOnly {
+		// The described object heads the view, whatever the filter.
+		v.rows = append(v.rows, descRow{kind: descObject, self: true, rel: k8s.Related{
+			Res: v.res, Obj: v.subject, Kind: v.subject.GetKind(), Name: v.subject.GetName(),
+			Note: k8s.SummaryOf(v.res, v.subject),
+		}})
+		if !v.loaded {
+			v.rows = append(v.rows, descRow{kind: descInfo, text: "loading…"})
+		}
 		for _, rel := range v.rels {
 			var items []descRow
 			for _, it := range rel.Items {
@@ -263,7 +280,7 @@ type jumpMsg struct{ rel k8s.Related }
 func (v *describeView) activate() tea.Cmd {
 	r, ok := v.Selected()
 	switch {
-	case !ok:
+	case !ok, r.self && r.rel.Res.Name == "": // a kind coral can't list
 		return nil
 	case r.kind == descObject:
 		return emit(jumpMsg{r.rel})
@@ -336,7 +353,7 @@ func (v *describeView) title() string {
 func (v *describeView) View() string {
 	iw := v.rect.w - 2
 	var lines []string
-	if !v.loaded {
+	if !v.loaded && len(v.rows) == 0 {
 		lines = append(lines, stMuted.Render(" loading…"))
 	}
 	reasonW := 0
@@ -358,6 +375,7 @@ func (v *describeView) View() string {
 			kindW = max(kindW, ansi.StringWidth(r.rel.Kind))
 		}
 	}
+	kindW = min(kindW, 24) // CiliumClusterwideNetworkPolicy
 	for i := v.offset; i < len(v.rows) && len(lines) < v.height(); i++ {
 		lines = append(lines, v.renderRow(v.rows[i], i == v.cursor, iw, kindW, reasonW, countW))
 	}
@@ -404,15 +422,20 @@ func (v *describeView) renderRow(r descRow, selected bool, w, kindW, reasonW, co
 		styled.WriteString(st.Render(s))
 	}
 	none := lipgloss.NewStyle()
-	if v.eventsOnly {
+	switch {
+	case v.eventsOnly:
 		part(" ", none)
-	} else {
+	case r.self:
+		part(" "+selfMarker+" ", stAccent.Bold(true))
+	default:
 		part("   ", none)
 	}
 	switch r.kind {
 	case descObject:
 		part(fit(r.rel.Kind, kindW)+"  ", stMuted)
 		switch {
+		case r.self:
+			part(r.rel.Name, stAccent.Bold(true))
 		case r.rel.Obj == nil:
 			part(r.rel.Name, stErr)
 		default:
@@ -452,3 +475,6 @@ func (v *describeView) renderRow(r descRow, selected bool, w, kindW, reasonW, co
 	}
 	return fit(styled.String(), w)
 }
+
+// selfMarker marks the described object, the top row of describe.
+const selfMarker = "▶"

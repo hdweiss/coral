@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"path/filepath"
 	"strings"
 	"time"
 
@@ -33,6 +34,7 @@ func rootCmd() *cobra.Command {
 		demo       bool
 		timeout    time.Duration
 		themeSpec  string
+		traceAPI   string
 	)
 	cmd := &cobra.Command{
 		Use:           "coral",
@@ -43,12 +45,25 @@ func rootCmd() *cobra.Command {
 		RunE: func(cmd *cobra.Command, args []string) error {
 			silenceKlog()
 			var (
-				p   k8s.Provider
-				err error
+				p     k8s.Provider
+				err   error
+				trace *k8s.Tracer
 			)
+			if traceAPI != "" {
+				f, err := os.OpenFile(traceAPI, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o600)
+				if err != nil {
+					return err
+				}
+				defer f.Close()
+				trace = k8s.NewTracer(f)
+			}
+			cacheDir := ""
+			if dir, err := os.UserCacheDir(); err == nil {
+				cacheDir = filepath.Join(dir, "coral")
+			}
 			if demo {
-				p = k8s.NewDemoProvider()
-			} else if p, err = k8s.NewKubeProvider(kubeconfig); err != nil {
+				p = k8s.NewDemoProvider(trace)
+			} else if p, err = k8s.NewKubeProvider(k8s.KubeOptions{Kubeconfig: kubeconfig, Trace: trace, CacheDir: cacheDir}); err != nil {
 				return err
 			}
 			if opts.Theme, err = theme.Resolve(themeSpec); err != nil {
@@ -57,7 +72,11 @@ func rootCmd() *cobra.Command {
 			opts.Version = version
 			opts.PinsPath = config.PinsPath(demo)
 			opts.FieldsPath = config.FieldsPath()
-			app, err := ui.New(k8s.NewStore(p, timeout), opts)
+			store := k8s.NewStore(p, timeout)
+			if !demo {
+				store.SetCacheDir(cacheDir)
+			}
+			app, err := ui.New(store, opts)
 			if err != nil {
 				return err
 			}
@@ -73,6 +92,7 @@ func rootCmd() *cobra.Command {
 	f.DurationVar(&opts.Refresh, "refresh", 10*time.Second, "background refresh interval of the visible list (0 disables)")
 	f.DurationVar(&timeout, "timeout", 30*time.Second, "timeout for API requests")
 	f.BoolVar(&demo, "demo", false, "use a built-in fake cluster")
+	f.StringVar(&traceAPI, "trace-api", "", "append every API request to this file (time, verb, path, status, bytes, duration)")
 	f.StringVar(&themeSpec, "theme", envOr("CORALCTL_THEME", "auto"),
 		`colors: "auto" (Omarchy's when installed, else coral), "omarchy", a built-in theme (`+strings.Join(theme.Names(), ", ")+`), or a path to an Omarchy colors.toml or theme directory ($CORALCTL_THEME)`)
 

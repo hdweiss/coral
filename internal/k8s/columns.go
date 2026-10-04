@@ -15,7 +15,8 @@ import (
 type Column struct {
 	Name  string
 	Value func(u *unstructured.Unstructured) string
-	// Sort returns the sort key (int64 or string). Nil means sort by Value.
+	// Sort returns the sort key (int64, float64 or string). Nil means sort
+	// by Value.
 	Sort func(u *unstructured.Unstructured) any
 	// Drop marks a column the table may hide when space runs out. Zero means
 	// always shown; higher values are hidden first.
@@ -44,6 +45,9 @@ var (
 
 // Columns returns the table columns for a resource.
 func Columns(r Resource) []Column {
+	if r.Custom {
+		return printerColumns(r.Printer)
+	}
 	switch r.Name {
 	case "pods":
 		return []Column{colName,
@@ -173,6 +177,8 @@ func Columns(r Resource) []Column {
 		return []Column{colName, col("STATUS", field("status", "phase")), colAge}
 	case "events":
 		return eventColumns()
+	case "customresourcedefinitions":
+		return crdColumns()
 	}
 	return []Column{colName, colAge}
 }

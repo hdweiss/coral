@@ -174,12 +174,16 @@ func (a *App) onUpdated(msg updatedMsg) tea.Cmd {
 	if msg.err != nil {
 		return a.retryEdit(msg.err)
 	}
-	key := a.editing.key
 	a.stopEditing("updated "+a.editing.desc, false)
-	if a.desc != nil {
-		return tea.Batch(a.fetch(key), a.desc.load(a.store, 0, 0))
+	// The store already holds the updated object.
+	if e, ok := a.store.Get(a.cur); ok {
+		a.table.SetEntry(e)
+		a.syncDetail()
 	}
-	return a.fetch(key)
+	if a.desc != nil {
+		return a.desc.load(a.store, 0, true)
+	}
+	return nil
 }
 
 // --- adding fields ---

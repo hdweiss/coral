@@ -35,11 +35,16 @@ What people reach for k9s for most of the time.
   - Full `kubectl describe` text (conditions, container states, probes) via `k8s.io/kubectl/pkg/describe` or `kubectl describe`, perhaps as another section.
   - Relations of CRDs (ownerReferences work already; selectors don't).
 
+## Network traffic
+
+Done (see status.md) except watches: lists open on enter rather than cursor movement, refresh pauses when hidden, cheaper ⚠ markers, watch-cache lists, in-flight dedupe, server-side event filters, a disk cache for CRDs and OpenAPI, and `--trace-api`. The itemized plan is in [network.md](network.md). Still open:
+  - Item 6, watching the visible list instead of relisting it.
+
 ## Phase 2: reach
 
-- **API discovery and CRDs.** Use `ServerPreferredResources` per context, merged with the builtin registry (builtins keep their columns and aliases). The navigator gets a "Custom Resources" category grouped by API group, and `:` completes every resource name, short name and plural.
-  - Columns for CRDs come from `additionalPrinterColumns` (JSONPath), falling back to the generic NAME/AGE columns. This is the "server-side tables" option from status.md, done client-side.
-  - Cache discovery per context with a TTL. Demo: a couple of fake CRDs (e.g. `certificates.cert-manager.io`) with instances.
+- **API discovery and CRDs.** Done for CRDs as designed in [crds.md](crds.md) (see status.md): a Custom Resources category grouped by API group, well-known groups in builtin categories, columns from `additionalPrinterColumns`, `:` for every custom resource, `o` in the CRDs list. Still open (the "Later" section of crds.md):
+  - Full API discovery (`ServerPreferredResources`) for aggregated APIs and builtins without columns, and as the fallback when listing CRDs is forbidden.
+  - Schemas for `i`/`ctrl+n` from a CRD's own `openAPIV3Schema`, `d` on a CRD. Relations of more CRDs (Linkerd authorization policies, Istio, KEDA, Prometheus operator selectors); cert-manager, Cilium, Linkerd Server/ServiceProfile and the Gateway API are done.
 - **Drill-down and relations.**
   - Owners to pods: from a deployment, statefulset, daemonset, replicaset or job, show the pods it owns (selector or ownerReferences). From a node, its pods (`spec.nodeName`). From a service, the pods it selects.
   - "Show owner" jumps up the ownerReferences chain.

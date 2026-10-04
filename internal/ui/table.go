@@ -153,6 +153,8 @@ func (t *tableView) sortRows() {
 		switch ka := key(a).(type) {
 		case int64:
 			c = cmp.Compare(ka, key(b).(int64))
+		case float64:
+			c = cmp.Compare(ka, key(b).(float64))
 		case string:
 			c = cmp.Compare(ka, key(b).(string))
 		}
@@ -216,6 +218,9 @@ func (t *tableView) Update(msg tea.Msg) tea.Cmd {
 			}
 			if msg.double {
 				t.remember()
+				if t.res.ID() == "customresourcedefinitions" {
+					return emit(openInstancesMsg{})
+				}
 				return emit(openDetailMsg{})
 			}
 		}
@@ -451,7 +456,7 @@ func joinCells(cells []string) string {
 
 func (t *tableView) renderRow(r tableRow, widths []int, selected bool, iw int) string {
 	var cells []string
-	warn := t.res.Name == "events" && k8s.IsWarning(r.obj)
+	warn := t.res.ID() == "events" && k8s.IsWarning(r.obj)
 	nc := t.nameCol()
 	for i, c := range r.cells {
 		if widths[i] == 0 {

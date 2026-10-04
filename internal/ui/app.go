@@ -45,6 +45,9 @@ type (
 		entry k8s.Entry
 	}
 	tickMsg time.Time
+	// openInstancesMsg opens the instances of the CRD selected in the CRDs
+	// list.
+	openInstancesMsg struct{}
 )
 
 // button is a clickable region of the header or status bar.
@@ -78,6 +81,7 @@ type App struct {
 	cur k8s.Key
 
 	loading map[k8s.Key]bool
+	blurred bool // the terminal lost focus; refreshes pause
 
 	navW, detailW int
 	drag          int // 0 none, 1 nav|table divider, 2 table|detail divider
@@ -172,11 +176,19 @@ func New(store *k8s.Store, opts Options) (*App, error) {
 
 func (a *App) Init() tea.Cmd {
 	pods := k8s.MustLookup("pods")
-	return tea.Batch(
+	cmds := []tea.Cmd{
 		a.fetch(k8s.Key{Context: a.ctx, GVR: nsGVR}),
+		a.fetchCRDs(a.ctx),
 		a.activate(k8s.Key{Context: a.ctx, GVR: pods.GVR(), Namespace: a.ns}, pods),
 		tick(),
-	)
+	}
+	// Pins of custom resources show once their context's CRDs are known.
+	for _, pin := range a.nav.pins {
+		if _, builtin := k8s.Lookup(pin.Resource); pin.Resource != "" && !builtin && a.nav.known(pin.Context) {
+			cmds = append(cmds, a.fetchCRDs(pin.Context))
+		}
+	}
+	return tea.Batch(cmds...)
 }
 
 func tick() tea.Cmd {
@@ -185,6 +197,11 @@ func tick() tea.Cmd {
 
 // fetch lists key in the background unless a fetch is already running.
 func (a *App) fetch(key k8s.Key) tea.Cmd {
+	store := a.store
+	return a.fetchWith(key, func() k8s.Entry { return store.Fetch(key) })
+}
+
+func (a *App) fetchWith(key k8s.Key, list func() k8s.Entry) tea.Cmd {
 	if a.loading[key] {
 		return nil
 	}
@@ -192,8 +209,35 @@ func (a *App) fetch(key k8s.Key) tea.Cmd {
 	if key == a.cur {
 		a.table.loading = true
 	}
+	return func() tea.Msg { return fetchedMsg{key: key, entry: list()} }
+}
+
+// fetchCRDs lists a context's CRDs, for its custom resources, unless they
+// are younger than CRDMaxAge in memory or on disk. They are not refreshed
+// on the tick, only by r in the CRDs list.
+func (a *App) fetchCRDs(ctx string) tea.Cmd {
+	key := k8s.CRDKey(ctx)
+	if e, ok := a.store.Get(key); ok && time.Since(e.FetchedAt) <= k8s.CRDMaxAge {
+		return nil
+	}
 	store := a.store
-	return func() tea.Msg { return fetchedMsg{key: key, entry: store.Fetch(key)} }
+	return a.fetchWith(key, func() k8s.Entry { return store.Cached(key, k8s.CRDMaxAge) })
+}
+
+// registry has a context's resources, custom ones included once its CRDs
+// are listed.
+func (a *App) registry(ctx string) *k8s.Registry { return a.store.Registry(ctx) }
+
+// resourceIn returns res as context ctx has it: builtins everywhere, a
+// custom resource only where its CRD is.
+func (a *App) resourceIn(ctx string, res k8s.Resource) (k8s.Resource, bool) {
+	if res.Name == "" {
+		return res, false
+	}
+	if !res.Custom {
+		return res, true
+	}
+	return a.registry(ctx).Lookup(res.ID())
 }
 
 // activate shows a resource list, from cache when possible.
@@ -213,10 +257,21 @@ func (a *App) activate(key k8s.Key, res k8s.Resource) tea.Cmd {
 	a.nav.Reveal(key, res)
 	a.syncDetail()
 	var cmds []tea.Cmd
-	if _, ok := a.store.Get(k8s.Key{Context: key.Context, GVR: nsGVR}); !ok {
-		cmds = append(cmds, a.fetch(k8s.Key{Context: key.Context, GVR: nsGVR}))
+	// A context folded in the navigator (say, a pin's) needs no namespaces
+	// or CRDs until it is expanded.
+	if a.nav.expanded(key.Context) {
+		if _, ok := a.store.Get(k8s.Key{Context: key.Context, GVR: nsGVR}); !ok {
+			cmds = append(cmds, a.fetch(k8s.Key{Context: key.Context, GVR: nsGVR}))
+		}
+		if key != k8s.CRDKey(key.Context) {
+			cmds = append(cmds, a.fetchCRDs(key.Context))
+		}
 	}
-	if !ok || time.Since(e.FetchedAt) > freshFor {
+	maxAge := freshFor
+	if key == k8s.CRDKey(key.Context) {
+		maxAge = k8s.CRDMaxAge
+	}
+	if !ok || time.Since(e.FetchedAt) > maxAge {
 		cmds = append(cmds, a.fetch(key))
 	}
 	if ek, ok := a.warningsKey(); ok {
@@ -231,13 +286,41 @@ func (a *App) activate(key k8s.Key, res k8s.Resource) tea.Cmd {
 	return tea.Batch(cmds...)
 }
 
-// warningsKey is the event list behind the table's warning markers. The
-// events list itself has none.
-func (a *App) warningsKey() (k8s.Key, bool) {
-	if a.cur.GVR == k8s.EventsGVR {
-		return k8s.Key{}, false
+// refreshDue refreshes what is on screen once the refresh interval has
+// passed: the list and its warnings, or the events of the describe view
+// (what an object relates to rarely changes; r reloads it). Nothing refreshes
+// while the terminal is unfocused, nor a list hidden by the log or describe
+// view; when they come back, the next tick catches up.
+func (a *App) refreshDue() tea.Cmd {
+	if a.opts.Refresh <= 0 || a.blurred {
+		return nil
 	}
-	return k8s.EventsKey(a.cur), true
+	stale := func(k k8s.Key) bool {
+		e, ok := a.store.Get(k)
+		return ok && time.Since(e.FetchedAt) >= a.opts.Refresh
+	}
+	switch {
+	case a.desc != nil:
+		if !a.desc.loading && time.Since(a.desc.at) >= a.opts.Refresh {
+			return a.desc.load(a.store, 0, false)
+		}
+		return nil
+	case a.logs != nil:
+		return nil
+	}
+	var cmds []tea.Cmd
+	if stale(a.cur) && a.cur != k8s.CRDKey(a.ctx) { // CRDs: only on r
+		cmds = append(cmds, a.fetch(a.cur))
+	}
+	if ek, ok := a.warningsKey(); ok && stale(ek) {
+		cmds = append(cmds, a.fetch(ek))
+	}
+	return tea.Batch(cmds...)
+}
+
+// warningsKey is the event list behind the table's warning markers.
+func (a *App) warningsKey() (k8s.Key, bool) {
+	return k8s.WarningsKey(a.cur, a.table.res)
 }
 
 func (a *App) setWarnings(e k8s.Entry) {
@@ -275,7 +358,7 @@ func (a *App) logPod() *unstructured.Unstructured {
 		}
 		return nil
 	}
-	if a.table.res.Name != "pods" {
+	if a.table.res.ID() != "pods" {
 		return nil
 	}
 	return a.table.Selected()
@@ -309,7 +392,7 @@ func (a *App) openDescribe(eventsOnly bool) tea.Cmd {
 	case a.desc != nil:
 		r, ok := a.desc.Selected()
 		switch {
-		case ok && r.kind == descObject && r.rel.Obj != nil:
+		case ok && r.kind == descObject && r.rel.Obj != nil && !r.self:
 			subject = r.rel.Obj
 		case a.desc.eventsOnly == eventsOnly:
 			return a.popDesc()
@@ -328,12 +411,16 @@ func (a *App) openDescribe(eventsOnly bool) tea.Cmd {
 	if a.filtering {
 		a.stopFilter(false)
 	}
-	v := newDescribeView(a.cur.Context, subject, eventsOnly)
+	res, ok := a.registry(a.cur.Context).ForKind(subject.GetAPIVersion(), subject.GetKind())
+	if !ok {
+		res = k8s.Resource{Kind: subject.GetKind()}
+	}
+	v := newDescribeView(a.cur.Context, subject, res, eventsOnly)
 	v.prev = a.desc
 	a.closeLogs()
 	a.desc = v
 	a.setFocus(focusTable)
-	cmd := v.load(a.store, freshFor, freshFor)
+	cmd := v.load(a.store, freshFor, true)
 	a.syncDetail()
 	return cmd
 }
@@ -350,7 +437,7 @@ func (a *App) popDesc() tea.Cmd {
 	a.desc = a.desc.prev
 	var cmd tea.Cmd
 	if a.desc != nil && time.Since(a.desc.at) > freshFor {
-		cmd = a.desc.load(a.store, freshFor, freshFor)
+		cmd = a.desc.load(a.store, freshFor, true)
 	}
 	a.setFocus(focusTable)
 	a.syncDetail()
@@ -383,6 +470,27 @@ func (a *App) jump(rel k8s.Related) tea.Cmd {
 	a.table.Select(string(rel.Obj.GetUID()))
 	a.syncDetail()
 	return cmd
+}
+
+// openInstances lists the instances of the CRD selected in the CRDs list:
+// in the current namespace (or all namespaces) for namespaced ones,
+// cluster-wide otherwise.
+func (a *App) openInstances() tea.Cmd {
+	crd := a.table.Selected()
+	if crd == nil || a.table.res.ID() != "customresourcedefinitions" {
+		return nil
+	}
+	parsed := k8s.CustomResources([]unstructured.Unstructured{*crd})
+	if len(parsed) == 0 {
+		a.setFlash(crd.GetName()+" serves no version", true)
+		return nil
+	}
+	res := parsed[0]
+	if r, ok := a.registry(a.ctx).Lookup(res.ID()); ok {
+		res = r // the same node in the navigator
+	}
+	a.setFocus(focusTable)
+	return a.activate(a.keyFor(a.ctx, a.ns, res), res)
 }
 
 // subview reports whether a log, events or describe view replaces the table.
@@ -436,7 +544,7 @@ func (a *App) currentPin() config.Pin {
 
 func (a *App) togglePin(pin config.Pin) {
 	added := a.nav.togglePin(pin)
-	label := pinLabel(pin)
+	label := pinLabel(pin, a.registry(pin.Context))
 	if added {
 		a.setFlash("pinned "+label, false)
 	} else {
@@ -451,8 +559,8 @@ func (a *App) togglePin(pin config.Pin) {
 // openPin jumps to a pinned namespace, keeping the resource type when it is
 // namespaced.
 func (a *App) openPin(pin config.Pin) tea.Cmd {
-	res, _ := k8s.Lookup(a.table.res.Name)
-	if !res.Namespaced {
+	res, ok := a.resourceIn(pin.Context, a.table.res)
+	if !ok || !res.Namespaced {
 		res = k8s.MustLookup("pods")
 	}
 	return a.activate(a.keyFor(pin.Context, pin.Namespace, res), res)
@@ -492,6 +600,9 @@ func (a *App) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				a.setFlash(msg.entry.Err.Error(), true)
 			}
 		}
+		if msg.key == k8s.CRDKey(msg.key.Context) {
+			a.nav.SetCustom(msg.key.Context)
+		}
 		if k, ok := a.warningsKey(); ok && msg.key == k {
 			a.setWarnings(msg.entry)
 		}
@@ -505,6 +616,8 @@ func (a *App) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 	case jumpMsg:
 		cmd = a.jump(msg.rel)
+	case openInstancesMsg:
+		cmd = a.openInstances()
 	case openEventsMsg:
 		cmd = a.openDescribe(true)
 	case activateMsg:
@@ -515,7 +628,7 @@ func (a *App) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			a.syncDetail()
 		}
 	case needNamespacesMsg:
-		cmd = a.fetch(k8s.Key{Context: msg.context, GVR: nsGVR})
+		cmd = tea.Batch(a.fetch(k8s.Key{Context: msg.context, GVR: nsGVR}), a.fetchCRDs(msg.context))
 	case openDetailMsg:
 		a.setFocus(focusDetail)
 	case focusMsg:
@@ -544,21 +657,15 @@ func (a *App) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case openPinMsg:
 		cmd = a.openPin(msg.pin)
 	case tickMsg:
-		cmds := []tea.Cmd{tick()}
 		if t, ok := a.opts.Theme.Changed(); ok {
 			applyTheme(t)
 		}
-		if e, ok := a.store.Get(a.cur); ok && a.opts.Refresh > 0 && time.Since(e.FetchedAt) >= a.opts.Refresh {
-			cmds = append(cmds, a.fetch(a.cur))
-			if ek, ok := a.warningsKey(); ok {
-				cmds = append(cmds, a.fetch(ek))
-			}
-		}
-		// Events change often; what they relate to rarely does.
-		if d := a.desc; d != nil && !d.loading && a.opts.Refresh > 0 && time.Since(d.at) >= a.opts.Refresh {
-			cmds = append(cmds, d.load(a.store, 0, 30*time.Second))
-		}
-		cmd = tea.Batch(cmds...)
+		cmd = tea.Batch(tick(), a.refreshDue())
+	case tea.FocusMsg:
+		a.blurred = false
+		cmd = a.refreshDue()
+	case tea.BlurMsg:
+		a.blurred = true
 	case tea.KeyPressMsg:
 		cmd = a.handleKey(msg)
 	case tea.MouseMsg:
@@ -723,14 +830,25 @@ func (a *App) handleKey(msg tea.KeyPressMsg) tea.Cmd {
 		}
 		if a.desc != nil {
 			a.setFlash("refreshing…", false)
-			return a.desc.load(a.store, 0, 0)
+			return a.desc.load(a.store, 0, true)
 		}
 		a.setFlash("refreshing…", false)
-		return tea.Batch(a.fetch(a.cur), a.fetch(k8s.Key{Context: a.ctx, GVR: nsGVR}))
+		cmds := []tea.Cmd{a.fetch(a.cur)}
+		if ek, ok := a.warningsKey(); ok {
+			cmds = append(cmds, a.fetch(ek))
+		}
+		if a.nav.expanded(a.ctx) {
+			cmds = append(cmds, a.fetch(k8s.Key{Context: a.ctx, GVR: nsGVR}))
+		}
+		return tea.Batch(cmds...)
 	case "z":
 		a.zoom = !a.zoom
 		a.layout()
 		return nil
+	case "o":
+		if a.focus == focusTable && !a.subview() && a.table.res.ID() == "customresourcedefinitions" {
+			return a.openInstances()
+		}
 	case "esc":
 		switch {
 		case a.focus == focusDetail && a.detail.info.on:
@@ -812,7 +930,7 @@ func (a *App) previousLogs() tea.Cmd {
 // allNamespaces shows the current resource across all namespaces, or pods
 // when the resource is cluster-scoped (k9s's 0).
 func (a *App) allNamespaces() tea.Cmd {
-	res, _ := k8s.Lookup(a.table.res.Name)
+	res := a.table.res
 	if !res.Namespaced {
 		res = k8s.MustLookup("pods")
 	}
@@ -833,8 +951,13 @@ func (a *App) openPinNumber(n int) tea.Cmd {
 	}
 	switch {
 	case pin.Resource != "":
-		res, ok := k8s.Lookup(pin.Resource)
-		if !ok {
+		reg := a.registry(pin.Context)
+		res, ok := reg.Lookup(pin.Resource)
+		switch {
+		case !ok && reg == nil:
+			a.setFlash("loading the custom resources of "+pin.Context+"…", false)
+			return a.fetchCRDs(pin.Context)
+		case !ok:
 			a.setFlash("unknown resource "+pin.Resource, true)
 			return nil
 		}
@@ -842,7 +965,10 @@ func (a *App) openPinNumber(n int) tea.Cmd {
 	case pin.Namespace != "":
 		return a.openPin(pin)
 	}
-	res, _ := k8s.Lookup(a.table.res.Name)
+	res, ok := a.resourceIn(pin.Context, a.table.res)
+	if !ok {
+		res = k8s.MustLookup("pods")
+	}
 	return a.activate(a.keyFor(pin.Context, p.DefaultNamespace(pin.Context), res), res)
 }
 
@@ -1117,6 +1243,7 @@ func (a *App) openPalette(initial string) tea.Cmd {
 	for _, r := range k8s.Builtins {
 		items = append(items, paletteItem{cmd: r.Name, desc: r.Title + " · " + strings.Join(r.Aliases, ", "), aliases: r.Aliases})
 	}
+	items = append(items, customPaletteItems(a.registry(a.ctx))...)
 	items = append(items, paletteItem{cmd: "ns all", desc: "all namespaces"})
 	if e, ok := a.store.Get(k8s.Key{Context: a.ctx, GVR: nsGVR}); ok {
 		for _, it := range e.Items {
@@ -1134,7 +1261,7 @@ func (a *App) openPalette(initial string) tea.Cmd {
 		pinDesc = strings.Replace(pinDesc, "namespace", "cluster", 1)
 	}
 	items = append(items, paletteItem{cmd: "pin", desc: pinDesc, aliases: []string{"unpin"}})
-	if a.table.res.Name == "pods" {
+	if a.table.res.ID() == "pods" {
 		items = append(items, paletteItem{cmd: "logs", desc: "show the selected pod's log", aliases: []string{"log"}})
 	}
 	items = append(items, paletteItem{cmd: "quit", desc: "exit coral", aliases: []string{"q"}})
@@ -1147,7 +1274,7 @@ func (a *App) runCommand(text string) tea.Cmd {
 	if len(f) == 0 {
 		return nil
 	}
-	res, _ := k8s.Lookup(a.table.res.Name)
+	res := a.table.res
 	switch f[0] {
 	case "q", "quit", "q!":
 		return tea.Quit
@@ -1166,6 +1293,11 @@ func (a *App) runCommand(text string) tea.Cmd {
 		}
 		a.nav.root(f[1]).expanded = true
 		a.ns = a.store.Provider().DefaultNamespace(f[1])
+		if r, ok := a.resourceIn(f[1], res); ok {
+			res = r
+		} else {
+			res = k8s.MustLookup("pods")
+		}
 		return a.activate(a.keyFor(f[1], a.ns, res), res)
 	case "ns", "namespace":
 		if len(f) < 2 {
@@ -1180,7 +1312,7 @@ func (a *App) runCommand(text string) tea.Cmd {
 		}
 		return a.activate(a.keyFor(a.ctx, ns, res), res)
 	}
-	r, ok := k8s.Lookup(f[0])
+	r, ok := a.registry(a.ctx).Lookup(f[0])
 	if !ok {
 		a.setFlash("unknown command: "+text, true)
 		return nil
@@ -1209,6 +1341,7 @@ func (a *App) View() tea.View {
 	v := tea.NewView("")
 	v.AltScreen = true
 	v.MouseMode = tea.MouseModeCellMotion
+	v.ReportFocus = true
 	v.WindowTitle = "coral"
 	if a.w == 0 {
 		return v
@@ -1403,7 +1536,7 @@ func (a *App) renderStatus() string {
 		if a.desc != nil {
 			hints = append(hints, hint{"esc", "back", a.popDesc})
 			switch r, ok := a.desc.Selected(); {
-			case ok && r.kind == descObject:
+			case ok && r.kind == descObject && !r.self:
 				hints = append(hints, hint{"enter", "go to", a.desc.activate}, describe, events)
 			case a.desc.eventsOnly:
 				hints = append(hints, describe)
@@ -1416,8 +1549,11 @@ func (a *App) renderStatus() string {
 			hints = append(hints, hint{"e", "edit", func() tea.Cmd { return a.startEdit(nil) }})
 			break
 		}
-		if a.table.res.Name == "pods" {
+		if a.table.res.ID() == "pods" {
 			hints = append(hints, hint{"L", "logs", a.openLogs})
+		}
+		if a.table.res.ID() == "customresourcedefinitions" {
+			hints = append(hints, hint{"o", "instances", a.openInstances})
 		}
 		hints = append(hints, describe, events,
 			hint{"e", "edit", func() tea.Cmd { return a.startEdit(nil) }},
@@ -1488,9 +1624,10 @@ func helpView(w, h int) string {
 			{"↑↓ j k", "move"},
 			{"pgup pgdn g G", "page / top / bottom (also ctrl+b ctrl+f)"},
 			{"← → h l", "collapse / expand, or move between panels"},
-			{"enter space", "open / toggle; on a resource in the navigator, go to its list"},
+			{"enter space", "open / toggle; on a resource in the navigator, open its list (also l or a click)"},
 			{"y", "table: go to the YAML details"},
 			{"s S", "table: next sort column / reverse"},
+			{"o", "CRDs list: open the selected CRD's instances (also double-click)"},
 			{"e", "edit the object in $EDITOR (at the selected field)"},
 			{"ctrl+n", "add a field below the selected one, from the API schema"},
 			{"ctrl+p ctrl+x", "details: favorite (to the top) / hide (to the bottom)"},

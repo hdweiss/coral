@@ -77,6 +77,11 @@ func (v *navView) SetPins(pins []config.Pin) {
 }
 
 func (v *navView) addPin(p config.Pin) {
+	reg := v.store.Registry(p.Context)
+	res, resOK := reg.Lookup(p.Resource)
+	if p.Resource != "" && !resOK && reg == nil && (v.known == nil || v.known(p.Context)) {
+		return // a custom resource: shown once the context's CRDs are listed
+	}
 	pin := p
 	n := v.pinned.add(&navNode{pin: &pin, ns: p.Namespace})
 	n.context = p.Context
@@ -84,15 +89,14 @@ func (v *navView) addPin(p config.Pin) {
 	case v.known != nil && !v.known(p.Context):
 		n.kind, n.err, n.label = nkInfo, true, p.Context+" (missing)"
 	case p.Resource != "":
-		res, ok := k8s.Lookup(p.Resource)
-		if !ok {
+		if !resOK {
 			n.kind, n.err, n.label = nkInfo, true, p.Resource+" (unknown)"
 			return
 		}
 		n.kind, n.res, n.label = nkResource, res, res.Title
 	case p.Namespace != "":
 		n.kind, n.label = nkNamespace, p.Namespace
-		addCategories(n)
+		addCategories(n, reg)
 	}
 }
 
@@ -144,7 +148,7 @@ func pinFor(n *navNode) config.Pin {
 		if !n.res.Namespaced {
 			ns = ""
 		}
-		return config.Pin{Context: n.context, Namespace: ns, Resource: n.res.Name}
+		return config.Pin{Context: n.context, Namespace: ns, Resource: n.res.ID()}
 	}
 	for ; n != nil; n = n.parent {
 		switch n.kind {
@@ -157,15 +161,15 @@ func pinFor(n *navNode) config.Pin {
 	return config.Pin{}
 }
 
-// pinLabel describes pin for messages.
-func pinLabel(pin config.Pin) string {
+// pinLabel describes pin for messages; reg is the pin's context's.
+func pinLabel(pin config.Pin, reg *k8s.Registry) string {
 	s := "⎈ " + pin.Context
 	if pin.Namespace != "" {
 		s = pin.Context + " › " + pin.Namespace
 	}
 	if pin.Resource != "" {
 		title := pin.Resource
-		if r, ok := k8s.Lookup(pin.Resource); ok {
+		if r, ok := reg.Lookup(pin.Resource); ok {
 			title = r.Title
 			if r.Namespaced && pin.Namespace == "" {
 				s = pin.Context + " › all"

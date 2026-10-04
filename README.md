@@ -5,11 +5,12 @@ A mouse-first Kubernetes TUI with tree views, inspired by [k9s](https://k9scli.i
 ## Features
 
 - **Navigator tree:** contexts › namespaces › categories › resources, with pinned clusters, namespaces and resource lists at the top (`1`–`9` jump to pins).
+- **Custom resources:** every CRD's kinds in the navigator, grouped by API group (Gateway API and other well-known groups sit with the builtins), with columns from the CRD's printer columns.
 - **Resource table:** click-to-sort headers, filtering with `/`, and columns that fit the terminal width.
 - **Folding YAML view:** per-kind favorite and hidden fields, field help from the cluster's OpenAPI schema (`i`).
 - **Editing:** `e` opens the object in `$EDITOR` like `kubectl edit`. `ctrl+n` adds a field with schema-driven suggestions.
 - **Logs:** `L` streams pod logs and parses JSON (including ECS), klog and plain text, with fields you can pin to every line.
-- **Events and describe:** an Events list per namespace, `E` for the selected object's events, a red `⚠N` on rows with recent warnings, and `d` for related objects (owners, pods, services, network policies, what it uses and what uses it) plus events.
+- **Events and describe:** an Events list per namespace, `E` for the selected object's events, a red `⚠N` on rows with recent warnings, and `d` for related objects (owners, pods, services, network policies, what it uses and what uses it, and cert-manager, Cilium, Linkerd and Gateway API resources) plus events.
 - **Theming:** built-in themes (`coral`, `catppuccin`, `kanagawa`), or follows the active [Omarchy](https://omarchy.org) theme live.
 - **Demo mode:** `--demo` runs against built-in fake clusters, no cluster needed.
 
@@ -38,7 +39,7 @@ coral -A                    # all namespaces
 coral --demo                # fake clusters
 ```
 
-Other flags: `--kubeconfig`, `--refresh`, `--timeout` and `--theme` (or `$CORALCTL_THEME`). Run `coral --help` for details, and press `?` in the app for key bindings.
+Other flags: `--kubeconfig`, `--refresh`, `--timeout`, `--theme` (or `$CORALCTL_THEME`) and `--trace-api <file>` (log every API request). Run `coral --help` for details, and press `?` in the app for key bindings.
 
 ## Development
 

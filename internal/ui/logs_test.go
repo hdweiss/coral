@@ -25,7 +25,7 @@ func TestPinLabels(t *testing.T) {
 }
 
 func TestLogViewStreamsDemoLogs(t *testing.T) {
-	p := k8s.NewDemoProvider()
+	p := k8s.NewDemoProvider(nil)
 	c, _ := p.Client("demo-dev")
 	list, err := c.Resource(k8s.MustLookup("pods").GVR()).Namespace("shop").List(context.Background(), metav1.ListOptions{})
 	if err != nil {

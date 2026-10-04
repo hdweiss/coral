@@ -4,6 +4,7 @@ import (
 	"errors"
 	"fmt"
 	"hash/fnv"
+	"slices"
 	"strconv"
 	"time"
 
@@ -25,16 +26,41 @@ type demoProvider struct {
 	clients map[string]dynamic.Interface
 }
 
-func NewDemoProvider() Provider {
-	listKinds := map[schema.GroupVersionResource]string{}
-	for _, r := range Builtins {
-		listKinds[r.GVR()] = r.Kind + "List"
-	}
+// NewDemoProvider builds the demo clusters. A non-nil trace logs every
+// request.
+func NewDemoProvider(trace *Tracer) Provider {
 	p := &demoProvider{clients: map[string]dynamic.Interface{}}
 	for _, name := range p.Contexts() {
 		objs := buildDemoCluster(name)
-		c := dynamicfake.NewSimpleDynamicClientWithCustomListKinds(runtime.NewScheme(), listKinds, objs...)
+		// The fake tracker would guess resource names from kinds (Gateway
+		// → gatewaies), so objects go in under their resource's GVR.
+		listKinds := map[schema.GroupVersionResource]string{}
+		gvrs := map[schema.GroupVersionKind]schema.GroupVersionResource{}
+		var crds []unstructured.Unstructured
+		for _, o := range objs {
+			if u := o.(*unstructured.Unstructured); u.GetKind() == "CustomResourceDefinition" {
+				crds = append(crds, *u)
+			}
+		}
+		for _, r := range append(slices.Clone(Builtins), CustomResources(crds)...) {
+			listKinds[r.GVR()] = r.Kind + "List"
+			gvrs[r.GVR().GroupVersion().WithKind(r.Kind)] = r.GVR()
+		}
+		c := dynamicfake.NewSimpleDynamicClientWithCustomListKinds(runtime.NewScheme(), listKinds)
+		for _, o := range objs {
+			u := o.(*unstructured.Unstructured)
+			gvr, ok := gvrs[u.GroupVersionKind()]
+			if !ok {
+				panic("demo object of unknown kind " + u.GroupVersionKind().String())
+			}
+			if err := c.Tracker().Create(gvr, u, u.GetNamespace()); err != nil {
+				panic(err)
+			}
+		}
 		c.PrependReactor("update", "*", versionUpdates(c.Tracker()))
+		if trace != nil {
+			c.PrependReactor("*", "*", trace.reactor(name))
+		}
 		p.clients[name] = c
 	}
 	return p
@@ -599,5 +625,6 @@ func buildDemoCluster(name string) []runtime.Object {
 	for _, ns := range nss {
 		d.add("v1", "ServiceAccount", ns, "default", 90*day, nil, nil)
 	}
+	d.customResources(prod)
 	return d.objs
 }

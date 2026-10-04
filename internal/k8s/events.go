@@ -13,10 +13,31 @@ import (
 // match than the regarding field of events.k8s.io/v1.
 var EventsGVR = MustLookup("events").GVR()
 
-// EventsKey is the event list that covers the objects of list k: the same
-// namespace, or all namespaces for a cluster-scoped list.
-func EventsKey(k Key) Key {
-	return Key{Context: k.Context, GVR: EventsGVR, Namespace: k.Namespace}
+// WarningsKey is the list of Warning events behind the markers of list k
+// (of resource res): the same namespace for namespaced resources. Of the
+// cluster-scoped resources only nodes have markers, from the Node events of
+// all namespaces; listing every event in the cluster for the others isn't
+// worth it. The events list itself has no markers.
+func WarningsKey(k Key, res Resource) (Key, bool) {
+	switch {
+	case k.GVR == EventsGVR:
+		return Key{}, false
+	case res.Namespaced:
+		return Key{Context: k.Context, GVR: EventsGVR, Namespace: k.Namespace, Fields: "type=Warning"}, true
+	case res.Kind == "Node":
+		return Key{Context: k.Context, GVR: EventsGVR, Fields: "type=Warning,involvedObject.kind=Node"}, true
+	}
+	return Key{}, false
+}
+
+// EventsKey is the list of the events about obj, for the events and describe
+// views: those naming its kind and name, in its namespace, or in any
+// namespace for cluster-scoped objects (node events go to default). The
+// selector also matches earlier objects of the same name; EventsAbout sorts
+// those out, and the events the demo's fake client returns unfiltered.
+func EventsKey(ctx string, obj *unstructured.Unstructured) Key {
+	return Key{Context: ctx, GVR: EventsGVR, Namespace: obj.GetNamespace(),
+		Fields: "involvedObject.kind=" + obj.GetKind() + ",involvedObject.name=" + obj.GetName()}
 }
 
 // WarningWindow is how far back the table's warning markers look. Clusters

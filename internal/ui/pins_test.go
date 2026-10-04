@@ -10,7 +10,7 @@ import (
 
 func newTestNav(t *testing.T) *navView {
 	t.Helper()
-	v := newNavView(k8s.NewStore(k8s.NewDemoProvider(), time.Second))
+	v := newNavView(k8s.NewStore(k8s.NewDemoProvider(nil), time.Second))
 	v.rect = rect{0, 0, 30, 40}
 	v.known = func(ctx string) bool { return ctx == "demo-dev" || ctx == "demo-prod" }
 	return v

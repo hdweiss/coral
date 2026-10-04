@@ -40,11 +40,7 @@ func (s *Store) Lister(ctx string, maxAge time.Duration) Lister {
 		if !res.Namespaced {
 			ns = ""
 		}
-		k := Key{Context: ctx, GVR: res.GVR(), Namespace: ns}
-		e, ok := s.Get(k)
-		if !ok || time.Since(e.FetchedAt) > maxAge {
-			e = s.Fetch(k)
-		}
+		e := s.Cached(Key{Context: ctx, GVR: res.GVR(), Namespace: ns}, maxAge)
 		return e.Items, e.Err
 	}
 }
@@ -53,6 +49,7 @@ func (s *Store) Lister(ctx string, maxAge time.Duration) Lister {
 // error. Sections without items are left out.
 type relator struct {
 	list Lister
+	reg  *Registry
 	obj  *unstructured.Unstructured
 	ns   string
 	out  []Relation
@@ -60,7 +57,11 @@ type relator struct {
 }
 
 func (r *relator) items(name, ns string) []unstructured.Unstructured {
-	items, err := r.list(MustLookup(name), ns)
+	return r.itemsOf(MustLookup(name), ns)
+}
+
+func (r *relator) itemsOf(res Resource, ns string) []unstructured.Unstructured {
+	items, err := r.list(res, ns)
 	if err != nil && r.err == nil {
 		r.err = err
 	}
@@ -79,10 +80,15 @@ func related(res Resource, obj *unstructured.Unstructured, note string) Related 
 
 // Relations computes the related summary of obj: its owners, what it owns or
 // selects, what selects it, what it uses and what uses it. Lists that fail
-// are skipped; the first error is returned with the sections found.
-func Relations(list Lister, obj *unstructured.Unstructured) ([]Relation, error) {
-	r := &relator{list: list, obj: obj, ns: obj.GetNamespace()}
+// are skipped; the first error is returned with the sections found. reg
+// resolves the kinds of owners and event objects, custom ones included.
+func Relations(list Lister, reg *Registry, obj *unstructured.Unstructured) ([]Relation, error) {
+	r := &relator{list: list, reg: reg, obj: obj, ns: obj.GetNamespace()}
 	r.add("Owners", r.owners())
+	if res, ok := reg.ForKind(obj.GetAPIVersion(), obj.GetKind()); ok && res.Custom {
+		r.customRelations(res)
+		return r.out, r.err
+	}
 	switch obj.GetKind() {
 	case "Pod":
 		if node := str(obj, "spec", "nodeName"); node != "" {
@@ -90,6 +96,7 @@ func Relations(list Lister, obj *unstructured.Unstructured) ([]Relation, error) 
 		}
 		r.add("Services", r.selectingServices(obj.GetLabels()))
 		r.add("Network policies", r.selectingPolicies(obj.GetLabels()))
+		r.addPodSelectors(obj.GetLabels(), PodSpec(obj))
 		r.add("Uses", r.uses())
 	case "Deployment":
 		r.add("ReplicaSets", r.owned("replicasets"))
@@ -132,18 +139,19 @@ func Relations(list Lister, obj *unstructured.Unstructured) ([]Relation, error) 
 		}
 		r.add("Pods", out)
 	case "HorizontalPodAutoscaler":
-		if res, ok := Lookup(str(obj, "spec", "scaleTargetRef", "kind")); ok {
-			r.add("Target", r.byName(res.Name, r.ns, []string{str(obj, "spec", "scaleTargetRef", "name")}, ""))
+		if res, ok := reg.ForKind(str(obj, "spec", "scaleTargetRef", "apiVersion"), str(obj, "spec", "scaleTargetRef", "kind")); ok {
+			r.add("Target", r.byRes(res, r.ns, []string{str(obj, "spec", "scaleTargetRef", "name")}, ""))
 		}
 	case "RoleBinding", "ClusterRoleBinding":
 		if res, ok := Lookup(str(obj, "roleRef", "kind")); ok {
 			r.add("Role", r.byName(res.Name, r.ns, []string{str(obj, "roleRef", "name")}, ""))
 		}
 	case "Event":
-		if res, ok := Lookup(str(obj, "involvedObject", "kind")); ok {
-			r.add("Object", r.byName(res.Name, str(obj, "involvedObject", "namespace"), []string{str(obj, "involvedObject", "name")}, ""))
+		if res, ok := reg.ForKind(str(obj, "involvedObject", "apiVersion"), str(obj, "involvedObject", "kind")); ok {
+			r.add("Object", r.byRes(res, str(obj, "involvedObject", "namespace"), []string{str(obj, "involvedObject", "name")}, ""))
 		}
 	}
+	r.customReverse()
 	return r.out, r.err
 }
 
@@ -155,6 +163,7 @@ func (r *relator) addWorkload() {
 	tmpl, _, _ := unstructured.NestedStringMap(r.obj.Object, "spec", "template", "metadata", "labels")
 	r.add("Services", r.selectingServices(tmpl))
 	r.add("Network policies", r.selectingPolicies(tmpl))
+	r.addPodSelectors(tmpl, PodSpec(r.obj))
 	r.add("Autoscalers", r.autoscalers())
 	r.add("Uses", r.uses())
 }
@@ -168,13 +177,13 @@ func (r *relator) owners() []Related {
 		if ref == nil {
 			break
 		}
-		res, ok := Lookup(ref.Kind)
+		res, ok := r.reg.ForKind(ref.APIVersion, ref.Kind)
 		if !ok {
 			out = append(out, Related{Kind: ref.Kind, Name: ref.Name, Note: "unknown kind"})
 			break
 		}
 		var owner *unstructured.Unstructured
-		items := r.items(res.Name, cur.GetNamespace())
+		items := r.itemsOf(res, cur.GetNamespace())
 		for i := range items {
 			if items[i].GetUID() == ref.UID {
 				owner = &items[i]
@@ -283,8 +292,11 @@ func (r *relator) ingressesTo(service string) []Related {
 // byName looks up objects of a resource by name; missing ones are listed as
 // not found.
 func (r *relator) byName(name, ns string, names []string, note string) []Related {
-	res := MustLookup(name)
-	items := r.items(name, ns)
+	return r.byRes(MustLookup(name), ns, names, note)
+}
+
+func (r *relator) byRes(res Resource, ns string, names []string, note string) []Related {
+	items := r.itemsOf(res, ns)
 	var out []Related
 	for _, n := range names {
 		i := slices.IndexFunc(items, func(u unstructured.Unstructured) bool { return u.GetName() == n })
@@ -502,13 +514,26 @@ func Summary(obj *unstructured.Unstructured) string {
 	if !ok {
 		return ""
 	}
-	for _, name := range []string{"STATUS", "READY"} {
+	return SummaryOf(res, obj)
+}
+
+// SummaryOf is Summary for an object of res, custom resources included.
+// Their READY comes first, since their STATUS is often a long message.
+func SummaryOf(res Resource, obj *unstructured.Unstructured) string {
+	order := []string{"STATUS", "READY"}
+	if res.Custom {
+		order = []string{"READY", "STATUS"}
+	}
+	for _, name := range order {
 		for _, c := range Columns(res) {
 			if c.Name != name {
 				continue
 			}
 			v := c.Value(obj)
-			if name == "READY" && !strings.Contains(v, "/") {
+			switch {
+			case v == "True" || v == "False": // a condition
+				v = map[bool]string{true: "Ready", false: "Not ready"}[v == "True"]
+			case name == "READY" && v != "" && !strings.Contains(v, "/"):
 				v = "ready " + v // a bare count, e.g. of a ReplicaSet
 			}
 			return v

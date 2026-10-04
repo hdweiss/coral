@@ -6,7 +6,8 @@ import (
 	"k8s.io/apimachinery/pkg/runtime/schema"
 )
 
-// Resource describes a Kubernetes resource type that coral knows how to list.
+// Resource describes a Kubernetes resource type that coral knows how to list:
+// a builtin, or a custom resource of one context.
 type Resource struct {
 	Name       string // plural resource name, e.g. "pods"
 	Kind       string
@@ -15,7 +16,24 @@ type Resource struct {
 	Version    string
 	Namespaced bool
 	Category   string
-	Aliases    []string
+	Aliases    []string // for builtins all names; for custom resources the short names, singular and kind
+
+	Custom  bool
+	Printer []PrinterColumn // a custom resource's additionalPrinterColumns
+}
+
+func builtin(name, kind, title, group, version string, namespaced bool, cat string, aliases []string) Resource {
+	return Resource{Name: name, Kind: kind, Title: title, Group: group, Version: version,
+		Namespaced: namespaced, Category: cat, Aliases: aliases}
+}
+
+// ID names the resource unambiguously within a context: the plural for
+// builtins, plural.group for custom resources. Pins store it.
+func (r Resource) ID() string {
+	if r.Custom {
+		return r.Name + "." + r.Group
+	}
+	return r.Name
 }
 
 func (r Resource) GVR() schema.GroupVersionResource {
@@ -36,6 +54,9 @@ const (
 	CatStorage   = "Storage"
 	CatAccess    = "Access Control"
 	CatCluster   = "Cluster"
+	// CatCustom holds the custom resources of groups that fit no builtin
+	// category, in a folder per group.
+	CatCustom = "Custom Resources"
 	// CatTop resources sit directly under a namespace in the navigator,
 	// after the categories.
 	CatTop = ""
@@ -45,37 +66,37 @@ const (
 var NamespacedCategories = []string{CatWorkloads, CatNetwork, CatConfig, CatStorage, CatAccess}
 
 var Builtins = []Resource{
-	{"pods", "Pod", "Pods", "", "v1", true, CatWorkloads, []string{"po", "pod"}},
-	{"deployments", "Deployment", "Deployments", "apps", "v1", true, CatWorkloads, []string{"deploy", "deployment", "dp"}},
-	{"statefulsets", "StatefulSet", "StatefulSets", "apps", "v1", true, CatWorkloads, []string{"sts", "statefulset"}},
-	{"daemonsets", "DaemonSet", "DaemonSets", "apps", "v1", true, CatWorkloads, []string{"ds", "daemonset"}},
-	{"replicasets", "ReplicaSet", "ReplicaSets", "apps", "v1", true, CatWorkloads, []string{"rs", "replicaset"}},
-	{"jobs", "Job", "Jobs", "batch", "v1", true, CatWorkloads, []string{"job"}},
-	{"cronjobs", "CronJob", "CronJobs", "batch", "v1", true, CatWorkloads, []string{"cj", "cronjob"}},
-	{"horizontalpodautoscalers", "HorizontalPodAutoscaler", "HPAs", "autoscaling", "v2", true, CatWorkloads, []string{"hpa"}},
+	builtin("pods", "Pod", "Pods", "", "v1", true, CatWorkloads, []string{"po", "pod"}),
+	builtin("deployments", "Deployment", "Deployments", "apps", "v1", true, CatWorkloads, []string{"deploy", "deployment", "dp"}),
+	builtin("statefulsets", "StatefulSet", "StatefulSets", "apps", "v1", true, CatWorkloads, []string{"sts", "statefulset"}),
+	builtin("daemonsets", "DaemonSet", "DaemonSets", "apps", "v1", true, CatWorkloads, []string{"ds", "daemonset"}),
+	builtin("replicasets", "ReplicaSet", "ReplicaSets", "apps", "v1", true, CatWorkloads, []string{"rs", "replicaset"}),
+	builtin("jobs", "Job", "Jobs", "batch", "v1", true, CatWorkloads, []string{"job"}),
+	builtin("cronjobs", "CronJob", "CronJobs", "batch", "v1", true, CatWorkloads, []string{"cj", "cronjob"}),
+	builtin("horizontalpodautoscalers", "HorizontalPodAutoscaler", "HPAs", "autoscaling", "v2", true, CatWorkloads, []string{"hpa"}),
 
-	{"services", "Service", "Services", "", "v1", true, CatNetwork, []string{"svc", "service"}},
-	{"ingresses", "Ingress", "Ingresses", "networking.k8s.io", "v1", true, CatNetwork, []string{"ing", "ingress"}},
-	{"networkpolicies", "NetworkPolicy", "NetworkPolicies", "networking.k8s.io", "v1", true, CatNetwork, []string{"netpol", "np"}},
+	builtin("services", "Service", "Services", "", "v1", true, CatNetwork, []string{"svc", "service"}),
+	builtin("ingresses", "Ingress", "Ingresses", "networking.k8s.io", "v1", true, CatNetwork, []string{"ing", "ingress"}),
+	builtin("networkpolicies", "NetworkPolicy", "NetworkPolicies", "networking.k8s.io", "v1", true, CatNetwork, []string{"netpol", "np"}),
 
-	{"configmaps", "ConfigMap", "ConfigMaps", "", "v1", true, CatConfig, []string{"cm", "configmap"}},
-	{"secrets", "Secret", "Secrets", "", "v1", true, CatConfig, []string{"sec", "secret"}},
+	builtin("configmaps", "ConfigMap", "ConfigMaps", "", "v1", true, CatConfig, []string{"cm", "configmap"}),
+	builtin("secrets", "Secret", "Secrets", "", "v1", true, CatConfig, []string{"sec", "secret"}),
 
-	{"persistentvolumeclaims", "PersistentVolumeClaim", "PVCs", "", "v1", true, CatStorage, []string{"pvc"}},
+	builtin("persistentvolumeclaims", "PersistentVolumeClaim", "PVCs", "", "v1", true, CatStorage, []string{"pvc"}),
 
-	{"events", "Event", "Events", "", "v1", true, CatTop, []string{"ev", "event"}},
+	builtin("events", "Event", "Events", "", "v1", true, CatTop, []string{"ev", "event"}),
 
-	{"serviceaccounts", "ServiceAccount", "ServiceAccounts", "", "v1", true, CatAccess, []string{"sa"}},
-	{"roles", "Role", "Roles", "rbac.authorization.k8s.io", "v1", true, CatAccess, []string{"role"}},
-	{"rolebindings", "RoleBinding", "RoleBindings", "rbac.authorization.k8s.io", "v1", true, CatAccess, []string{"rb"}},
+	builtin("serviceaccounts", "ServiceAccount", "ServiceAccounts", "", "v1", true, CatAccess, []string{"sa"}),
+	builtin("roles", "Role", "Roles", "rbac.authorization.k8s.io", "v1", true, CatAccess, []string{"role"}),
+	builtin("rolebindings", "RoleBinding", "RoleBindings", "rbac.authorization.k8s.io", "v1", true, CatAccess, []string{"rb"}),
 
-	{"nodes", "Node", "Nodes", "", "v1", false, CatCluster, []string{"no", "node"}},
-	{"namespaces", "Namespace", "Namespaces", "", "v1", false, CatCluster, []string{"ns", "namespace"}},
-	{"persistentvolumes", "PersistentVolume", "PersistentVolumes", "", "v1", false, CatCluster, []string{"pv"}},
-	{"storageclasses", "StorageClass", "StorageClasses", "storage.k8s.io", "v1", false, CatCluster, []string{"sc"}},
-	{"clusterroles", "ClusterRole", "ClusterRoles", "rbac.authorization.k8s.io", "v1", false, CatCluster, []string{"cr"}},
-	{"clusterrolebindings", "ClusterRoleBinding", "ClusterRoleBindings", "rbac.authorization.k8s.io", "v1", false, CatCluster, []string{"crb"}},
-	{"customresourcedefinitions", "CustomResourceDefinition", "CRDs", "apiextensions.k8s.io", "v1", false, CatCluster, []string{"crd", "crds"}},
+	builtin("nodes", "Node", "Nodes", "", "v1", false, CatCluster, []string{"no", "node"}),
+	builtin("namespaces", "Namespace", "Namespaces", "", "v1", false, CatCluster, []string{"ns", "namespace"}),
+	builtin("persistentvolumes", "PersistentVolume", "PersistentVolumes", "", "v1", false, CatCluster, []string{"pv"}),
+	builtin("storageclasses", "StorageClass", "StorageClasses", "storage.k8s.io", "v1", false, CatCluster, []string{"sc"}),
+	builtin("clusterroles", "ClusterRole", "ClusterRoles", "rbac.authorization.k8s.io", "v1", false, CatCluster, []string{"cr"}),
+	builtin("clusterrolebindings", "ClusterRoleBinding", "ClusterRoleBindings", "rbac.authorization.k8s.io", "v1", false, CatCluster, []string{"crb"}),
+	builtin("customresourcedefinitions", "CustomResourceDefinition", "CRDs", "apiextensions.k8s.io", "v1", false, CatCluster, []string{"crd", "crds"}),
 }
 
 var lookup = func() map[string]Resource {

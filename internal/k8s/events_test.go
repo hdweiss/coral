@@ -30,7 +30,7 @@ func find(t *testing.T, items []unstructured.Unstructured, prefix string) *unstr
 }
 
 func TestDemoEventsAndWarnings(t *testing.T) {
-	s := NewStore(NewDemoProvider(), time.Second)
+	s := NewStore(NewDemoProvider(nil), time.Second)
 	events := demoList(t, s, "events", "shop")
 	ix := IndexWarnings(events, time.Now().Add(-WarningWindow))
 
@@ -103,11 +103,11 @@ func names(rels []Relation, title string) []string {
 }
 
 func TestDemoRelations(t *testing.T) {
-	s := NewStore(NewDemoProvider(), time.Second)
+	s := NewStore(NewDemoProvider(nil), time.Second)
 	list := s.Lister("demo-dev", time.Minute)
 	rel := func(obj *unstructured.Unstructured) []Relation {
 		t.Helper()
-		rels, err := Relations(list, obj)
+		rels, err := Relations(list, nil, obj)
 		if err != nil {
 			t.Fatal(err)
 		}

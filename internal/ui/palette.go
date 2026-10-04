@@ -7,6 +7,7 @@ import (
 	"charm.land/bubbles/v2/textinput"
 	tea "charm.land/bubbletea/v2"
 	"charm.land/lipgloss/v2"
+	"github.com/hdweiss/coral/internal/k8s"
 )
 
 type paletteItem struct {
@@ -169,4 +170,38 @@ func (p *palette) View(screenW int) string {
 	box := frame("Command", footer, lines, w, len(lines)+2, true)
 	p.rect = rect{(screenW - w) / 2, 2, w, lipgloss.Height(box)}
 	return box
+}
+
+// customPaletteItems offers a context's custom resources: by plural, or by
+// plural.group when a builtin or another group has the same plural. Their
+// aliases are the names that resolve to them and plural.group.
+func customPaletteItems(reg *k8s.Registry) []paletteItem {
+	var items []paletteItem
+	for _, r := range reg.Custom() {
+		resolves := func(name string) bool {
+			got, ok := reg.Lookup(name)
+			return ok && got.ID() == r.ID()
+		}
+		cmd := r.ID()
+		var aliases []string
+		if resolves(r.Name) {
+			cmd = r.Name
+			aliases = append(aliases, r.ID())
+		}
+		var short []string
+		for _, a := range r.Aliases {
+			if resolves(a) {
+				aliases = append(aliases, a)
+			}
+			if a != strings.ToLower(r.Kind) && a != strings.ToLower(r.Title) && !strings.EqualFold(a, r.Kind) {
+				short = append(short, a)
+			}
+		}
+		desc := r.Title + " · " + r.Group
+		if len(short) > 0 {
+			desc += " · " + strings.Join(short, ", ")
+		}
+		items = append(items, paletteItem{cmd: cmd, desc: desc, aliases: aliases})
+	}
+	return items
 }

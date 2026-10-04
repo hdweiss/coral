@@ -8,7 +8,7 @@ import (
 )
 
 func TestDemoStoreListsEveryBuiltin(t *testing.T) {
-	s := NewStore(NewDemoProvider(), time.Second)
+	s := NewStore(NewDemoProvider(nil), time.Second)
 	for _, r := range Builtins {
 		e := s.Fetch(Key{Context: "demo-dev", GVR: r.GVR()})
 		if e.Err != nil {
@@ -31,7 +31,7 @@ func TestDemoStoreListsEveryBuiltin(t *testing.T) {
 }
 
 func TestDemoUpdateVersions(t *testing.T) {
-	s := NewStore(NewDemoProvider(), time.Second)
+	s := NewStore(NewDemoProvider(nil), time.Second)
 	key := Key{Context: "demo-dev", GVR: MustLookup("deployments").GVR()}
 	obj, err := s.GetObject(key, "shop", "cart")
 	if err != nil {
