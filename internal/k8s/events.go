@@ -170,3 +170,69 @@ func EventMessage(e *unstructured.Unstructured) string { return oneLine(str(e, "
 func oneLine(s string) string {
 	return strings.Join(strings.Fields(s), " ")
 }
+
+// ownedKinds are the resources a controller of each kind creates.
+var ownedKinds = map[string]string{
+	"Deployment": "replicasets", "CronJob": "jobs",
+	"ReplicaSet": "pods", "StatefulSet": "pods", "DaemonSet": "pods", "Job": "pods",
+}
+
+// Owned lists what obj owns down the controller chain: a deployment's
+// replica sets and their pods, a cron job's jobs and theirs. Their events
+// together with obj's tell the story of a rollout.
+func Owned(list Lister, obj *unstructured.Unstructured) ([]*unstructured.Unstructured, error) {
+	var out []*unstructured.Unstructured
+	var firstErr error
+	var walk func(parent *unstructured.Unstructured)
+	walk = func(parent *unstructured.Unstructured) {
+		name, ok := ownedKinds[parent.GetKind()]
+		if !ok {
+			return
+		}
+		items, err := list(MustLookup(name), obj.GetNamespace())
+		if err != nil && firstErr == nil {
+			firstErr = err
+		}
+		for i := range items {
+			if ref := controllerRef(&items[i]); ref != nil && ref.UID == parent.GetUID() {
+				out = append(out, &items[i])
+				walk(&items[i])
+			}
+		}
+	}
+	walk(obj)
+	return out, firstErr
+}
+
+// EventsAboutAny returns the events about any of objs, newest first.
+func EventsAboutAny(events []unstructured.Unstructured, objs []*unstructured.Unstructured) []*unstructured.Unstructured {
+	var out []*unstructured.Unstructured
+	for i := range events {
+		for _, o := range objs {
+			if About(&events[i], o) {
+				out = append(out, &events[i])
+				break
+			}
+		}
+	}
+	SortEvents(out)
+	return out
+}
+
+// ClusterWarningsKey is the list of a context's Warning events in every
+// namespace, behind the navigator's per-namespace counts (in live mode).
+func ClusterWarningsKey(ctx string) Key {
+	return Key{Context: ctx, GVR: EventsGVR, Fields: "type=Warning"}
+}
+
+// WarningsPerNamespace counts the Warning events seen since since, per
+// namespace.
+func WarningsPerNamespace(events []unstructured.Unstructured, since time.Time) map[string]int {
+	out := map[string]int{}
+	for i := range events {
+		if e := &events[i]; IsWarning(e) && !EventTime(e).Before(since) {
+			out[e.GetNamespace()]++
+		}
+	}
+	return out
+}

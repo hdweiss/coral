@@ -157,3 +157,32 @@ func TestDemoRelations(t *testing.T) {
 		t.Errorf("service ingresses: %v", got)
 	}
 }
+
+func TestOwnedTimeline(t *testing.T) {
+	s := NewStore(NewDemoProvider(nil), time.Second)
+	list := s.Lister("demo-dev", time.Minute)
+	deps, _ := list(MustLookup("deployments"), "shop")
+	dep := find(t, deps, "catalog")
+	owned, err := Owned(list, dep)
+	if err != nil {
+		t.Fatal(err)
+	}
+	kinds := map[string]int{}
+	for _, o := range owned {
+		kinds[o.GetKind()]++
+	}
+	if kinds["ReplicaSet"] != 1 || kinds["Pod"] != 2 {
+		t.Fatalf("catalog owns %v", kinds)
+	}
+	evs, _ := list(MustLookup("events"), "shop")
+	got := EventsAboutAny(evs, append(owned, dep))
+	var pods int
+	for _, e := range got {
+		if strings.HasPrefix(EventObject(e), "pod/catalog-") {
+			pods++
+		}
+	}
+	if pods == 0 {
+		t.Error("the timeline has no events of the crash-looping pod")
+	}
+}

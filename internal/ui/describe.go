@@ -55,13 +55,16 @@ type describeView struct {
 	eventsOnly bool
 	prev       *describeView // the view this one was opened from; esc returns to it
 
-	rels    []k8s.Relation
-	events  []*unstructured.Unstructured
-	loaded  bool
-	loading bool
-	err     error
-	at      time.Time // when the last load started
-	gen     int
+	rels   []k8s.Relation
+	events []*unstructured.Unstructured
+	// timeline: the events are also those of what the subject owns (a
+	// deployment's replica sets and pods), so each row names its object.
+	timeline bool
+	loaded   bool
+	loading  bool
+	err      error
+	at       time.Time // when the last load started
+	gen      int
 
 	rows   []descRow
 	cursor int
@@ -76,6 +79,7 @@ type describeMsg struct {
 	rels     []k8s.Relation
 	keepRels bool // only the events were loaded
 	events   []*unstructured.Unstructured
+	timeline bool // the events include those of owned objects
 	err      error
 }
 
@@ -94,15 +98,29 @@ func (v *describeView) load(store *k8s.Store, maxAge time.Duration, withRels boo
 	gen, obj, ctx := v.gen, v.subject, v.ctx
 	withRels = withRels && !v.eventsOnly
 	rel, reg := store.Lister(ctx, maxAge), store.Registry(ctx)
+	// What the subject owns changes less often than its events; the tick's
+	// event refresh needn't relist pods and replica sets each time.
+	ownedList := store.Lister(ctx, max(maxAge, 30*time.Second))
 	return func() tea.Msg {
 		msg := describeMsg{view: v, gen: gen, keepRels: !withRels}
 		var relErr error
 		if withRels {
 			msg.rels, relErr = k8s.Relations(rel, reg, obj)
 		}
+		// A controller's events come with those of what it owns, as a
+		// timeline of its rollouts: then the namespace's events are listed
+		// once rather than per object.
+		owned, ownErr := k8s.Owned(ownedList, obj)
+		if len(owned) > 0 {
+			e := store.Cached(k8s.Key{Context: ctx, GVR: k8s.EventsGVR, Namespace: obj.GetNamespace()}, maxAge)
+			msg.events = k8s.EventsAboutAny(e.Items, append(owned, obj))
+			msg.timeline = true
+			msg.err = errors.Join(relErr, ownErr, e.Err)
+			return msg
+		}
 		e := store.Cached(k8s.EventsKey(ctx, obj), maxAge)
 		msg.events = k8s.EventsAbout(e.Items, obj)
-		msg.err = errors.Join(relErr, e.Err)
+		msg.err = errors.Join(relErr, ownErr, e.Err)
 		return msg
 	}
 }
@@ -115,7 +133,7 @@ func (v *describeView) onLoaded(msg describeMsg) {
 	if !msg.keepRels {
 		v.rels = msg.rels
 	}
-	v.events, v.err = msg.events, msg.err
+	v.events, v.err, v.timeline = msg.events, msg.err, msg.timeline
 	v.rebuild()
 }
 
@@ -363,12 +381,16 @@ func (v *describeView) View() string {
 		}
 	}
 	reasonW = min(reasonW, 24)
-	countW := 0
+	countW, objW := 0, 0
 	for _, r := range v.rows {
 		if r.kind == descEvent {
 			countW = max(countW, ansi.StringWidth(eventCount(r.ev)))
+			if v.timeline {
+				objW = max(objW, ansi.StringWidth(k8s.EventObject(r.ev)))
+			}
 		}
 	}
+	objW = min(objW, iw/3)
 	kindW := 0
 	for _, r := range v.rows {
 		if r.kind == descObject {
@@ -377,7 +399,7 @@ func (v *describeView) View() string {
 	}
 	kindW = min(kindW, 24) // CiliumClusterwideNetworkPolicy
 	for i := v.offset; i < len(v.rows) && len(lines) < v.height(); i++ {
-		lines = append(lines, v.renderRow(v.rows[i], i == v.cursor, iw, kindW, reasonW, countW))
+		lines = append(lines, v.renderRow(v.rows[i], i == v.cursor, iw, kindW, reasonW, countW, objW))
 	}
 
 	var footer []string
@@ -404,7 +426,7 @@ func eventCount(e *unstructured.Unstructured) string {
 	return ""
 }
 
-func (v *describeView) renderRow(r descRow, selected bool, w, kindW, reasonW, countW int) string {
+func (v *describeView) renderRow(r descRow, selected bool, w, kindW, reasonW, countW, objW int) string {
 	switch r.kind {
 	case descHeader:
 		return " " + stAccent.Bold(true).Render(fit(r.text, w-1))
@@ -460,6 +482,9 @@ func (v *describeView) renderRow(r descRow, selected bool, w, kindW, reasonW, co
 		part(fit(k8s.LastSeen(e), 7)+" ", stMuted)
 		part(fit(typ, 7)+" ", warn)
 		part(fit(stringField(e, "reason"), reasonW)+"  ", warn)
+		if objW > 0 {
+			part(fit(k8s.EventObject(e), objW)+"  ", stKey)
+		}
 		if countW > 0 {
 			part(fmt.Sprintf("%*s  ", countW, eventCount(e)), stMuted)
 		}

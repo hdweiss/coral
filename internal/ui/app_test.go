@@ -81,19 +81,26 @@ func TestLiveWatchesVisibleList(t *testing.T) {
 	a.store.Fetch(a.cur)
 	a.Update(tea.KeyPressMsg{Code: 'R', Text: "R"})
 	ek, _ := a.warningsKey()
-	if len(a.watches) != 2 || a.watches[a.cur] == nil || a.watches[ek] == nil {
-		t.Fatalf("watches %v, want the list and its warnings", a.watches)
+	nk := k8s.ClusterWarningsKey(a.cur.Context)
+	if len(a.watches) != 3 || a.watches[a.cur] == nil || a.watches[ek] == nil || a.watches[nk] == nil {
+		t.Fatalf("watches %v, want the list, its warnings and the navigator's", a.watches)
 	}
 	clear(a.loading)
 	if a.refreshDue() != nil {
 		t.Error("polling a watched list")
 	}
 
-	// A change to the cluster reaches the table without a fetch.
+	// A change to the cluster reaches the table without a fetch. (A
+	// creation, since the fake watch replays those if it happens between
+	// the watch's list and its watch; a real API server replays deletions
+	// too.)
 	e, _ := a.store.Get(a.cur)
-	victim := e.Items[0].GetName()
+	pod := e.Items[0].DeepCopy()
+	pod.SetName("new-pod")
+	pod.SetUID("new-pod-uid")
+	pod.SetResourceVersion("")
 	ri, _ := a.store.Provider().Client(a.cur.Context)
-	if err := ri.Resource(a.cur.GVR).Namespace(a.cur.Namespace).Delete(context.Background(), victim, metav1.DeleteOptions{}); err != nil {
+	if _, err := ri.Resource(a.cur.GVR).Namespace(a.cur.Namespace).Create(context.Background(), pod, metav1.CreateOptions{}); err != nil {
 		t.Fatal(err)
 	}
 	deadline := time.After(2 * time.Second)
@@ -104,21 +111,21 @@ func TestLiveWatchesVisibleList(t *testing.T) {
 		case m := <-msg:
 			a.Update(m)
 		case <-deadline:
-			t.Fatal("the deletion never reached the table")
+			t.Fatal("the new pod never reached the table")
 		}
-		if len(a.table.rows) == len(e.Items)-1 {
+		if len(a.table.rows) == len(e.Items)+1 {
 			break
 		}
 	}
 
 	a.logs = &logView{}
 	a.syncWatches()
-	if len(a.watches) != 0 {
+	if len(a.watches) != 1 || a.watches[nk] == nil {
 		t.Error("watching a list hidden by the log view")
 	}
 	a.logs = nil
 	a.Update(tea.BlurMsg{})
-	if len(a.watches) != 2 {
+	if len(a.watches) != 3 {
 		t.Error("an unfocused terminal stopped the watches")
 	}
 	a.Update(tea.KeyPressMsg{Code: 'R', Text: "R"})
@@ -226,5 +233,31 @@ func TestDeleteAsksFirst(t *testing.T) {
 	a.Update(msg)
 	if _, err := a.store.GetObject(a.cur, victim.GetNamespace(), victim.GetName()); err == nil {
 		t.Error("the pod is still there")
+	}
+}
+
+func TestNavigatorWarningsInLiveMode(t *testing.T) {
+	a := newTestApp(t, Options{})
+	showPods(t, a)
+	nsKey := k8s.Key{Context: "demo-dev", GVR: nsGVR}
+	a.Update(fetchedMsg{key: nsKey, entry: a.store.Fetch(nsKey)})
+	a.Update(tea.KeyPressMsg{Code: 'R', Text: "R"})
+	deadline := time.After(2 * time.Second)
+	for a.nav.warnings["demo-dev"]["shop"] == 0 {
+		msg := make(chan tea.Msg)
+		go func() { msg <- a.waitWatched()() }()
+		select {
+		case m := <-msg:
+			a.Update(m)
+		case <-deadline:
+			t.Fatalf("no warning count for shop: %v", a.nav.warnings)
+		}
+	}
+	if !strings.Contains(a.nav.View(), "⚠") {
+		t.Errorf("the navigator doesn't show the count:\n%s", a.nav.View())
+	}
+	a.Update(tea.KeyPressMsg{Code: 'R', Text: "R"})
+	if a.nav.warnings["demo-dev"] != nil {
+		t.Error("counts stay after live mode is off")
 	}
 }

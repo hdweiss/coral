@@ -71,6 +71,18 @@ type navView struct {
 	pins     []config.Pin
 	pinned   *navNode              // the "Pinned" section, shown above the contexts
 	known    func(ctx string) bool // whether a context exists in the kubeconfig
+
+	// warnings counts recent Warning events per context and namespace,
+	// shown after namespace names; only filled in live mode.
+	warnings map[string]map[string]int
+}
+
+// SetWarnings sets a context's warning counts per namespace; nil clears them.
+func (v *navView) SetWarnings(ctx string, perNS map[string]int) {
+	if v.warnings == nil {
+		v.warnings = map[string]map[string]int{}
+	}
+	v.warnings[ctx] = perNS
 }
 
 func newNavView(store *k8s.Store) *navView {
@@ -530,7 +542,12 @@ func (v *navView) renderLine(n *navNode, selected bool, w int) string {
 		}
 		isActive = key == v.active
 	}
-	// Pins end in a × that unpins them.
+	warn := ""
+	if n.kind == nkNamespace {
+		if c := v.warnings[n.context][n.ns]; c > 0 {
+			warn = warningMark(c)
+		}
+	}
 	// Pins end in their number key (1-9) and a × that unpins them.
 	unpin := ""
 	if n.pin != nil {
@@ -543,7 +560,7 @@ func (v *navView) renderLine(n *navNode, selected bool, w int) string {
 		if v.focused {
 			st = stSel
 		}
-		return st.Render(fit(indent+glyph+label+star+suffix+loc, w) + unpin)
+		return st.Render(fit(indent+glyph+label+star+suffix+warn+loc, w) + unpin)
 	}
 	var ls string
 	switch {
@@ -562,7 +579,7 @@ func (v *navView) renderLine(n *navNode, selected bool, w int) string {
 	default:
 		ls = label
 	}
-	line := indent + stMuted.Render(glyph) + ls + stAccent.Render(star) + stMuted.Render(suffix) + stMuted.Render(loc)
+	line := indent + stMuted.Render(glyph) + ls + stAccent.Render(star) + stMuted.Render(suffix) + stErr.Render(warn) + stMuted.Render(loc)
 	if unpin != "" {
 		return fit(line, w) + stMuted.Render(unpin)
 	}

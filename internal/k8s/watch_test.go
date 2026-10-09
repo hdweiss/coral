@@ -36,6 +36,7 @@ func TestWatchFollowsChanges(t *testing.T) {
 		}
 	}
 	waitFor("the list", func(e Entry) bool { return len(e.Items) > 0 && e.ResourceVersion != "" })
+	waitWatch(t, &log)
 	before, _ := s.Get(key)
 
 	ri, _ := s.resource(key, "shop")
@@ -83,12 +84,7 @@ func TestWatchFollowsAfterRelist(t *testing.T) {
 	notified := make(chan struct{}, 100)
 	stop := s.Watch(key, func() { notified <- struct{}{} })
 	defer stop()
-	for deadline := time.Now().Add(2 * time.Second); !strings.Contains(log.String(), "WATCH"); {
-		if time.Now().After(deadline) {
-			t.Fatal("no watch")
-		}
-		time.Sleep(10 * time.Millisecond)
-	}
+	waitWatch(t, &log)
 	s.Fetch(key) // r while live: the running watch must not apply to this list
 	ri, _ := s.resource(key, "shop")
 	ctx := context.Background()
@@ -133,6 +129,20 @@ func TestApplyAfterRelist(t *testing.T) {
 	if changed, err := s.apply(key, &rv, []watch.Event{{Type: watch.Added, Object: pod}}); !changed || err != nil || rv != "8" {
 		t.Fatalf("changed %v, err %v, rv %s", changed, err, rv)
 	}
+}
+
+// waitWatch waits until the watch request was sent: the fake's watch can't
+// replay a deletion that happens between the list and the watch.
+func waitWatch(t *testing.T, log *syncBuffer) {
+	t.Helper()
+	for deadline := time.Now().Add(2 * time.Second); !strings.Contains(log.String(), "WATCH"); {
+		if time.Now().After(deadline) {
+			t.Fatal("no watch")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	// The tracer logs just before the fake registers the watcher.
+	time.Sleep(20 * time.Millisecond)
 }
 
 // syncBuffer is a bytes.Buffer safe to read while the tracer writes to it.

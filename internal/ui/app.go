@@ -242,6 +242,19 @@ func (a *App) syncWatches() {
 			want[ek] = true
 		}
 	}
+	// The navigator's ⚠ counts per namespace, for the expanded contexts.
+	if a.live {
+		for _, ctx := range a.store.Provider().Contexts() {
+			if a.nav.expanded(ctx) {
+				want[k8s.ClusterWarningsKey(ctx)] = true
+			}
+		}
+	}
+	for _, ctx := range a.store.Provider().Contexts() {
+		if !want[k8s.ClusterWarningsKey(ctx)] {
+			a.nav.SetWarnings(ctx, nil)
+		}
+	}
 	for k, stop := range a.watches {
 		if !want[k] {
 			stop()
@@ -831,6 +844,9 @@ func (a *App) onEntry(key k8s.Key, e k8s.Entry) {
 	}
 	if k, ok := a.warningsKey(); ok && key == k {
 		a.setWarnings(e)
+	}
+	if key == k8s.ClusterWarningsKey(key.Context) && a.watches[key] != nil && e.Err == nil {
+		a.nav.SetWarnings(key.Context, k8s.WarningsPerNamespace(e.Items, time.Now().Add(-k8s.WarningWindow)))
 	}
 }
 
