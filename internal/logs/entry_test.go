@@ -1,6 +1,9 @@
 package logs
 
 import (
+	"bufio"
+	"io"
+	"strings"
 	"testing"
 	"time"
 )
@@ -63,5 +66,72 @@ func TestCompact(t *testing.T) {
 	}
 	if got := Compact("x"); got != "x" {
 		t.Errorf("Compact string = %s", got)
+	}
+}
+
+func TestParseECSVariants(t *testing.T) {
+	// Colors and CRLF in the message must not reach the terminal.
+	e := Parse("{\"@timestamp\":\"2026-10-03T09:59:59.1234567+00:00\",\"log.level\":\"Information\",\"message\":\"\\u001b[32mstarted\\u001b[0m\\r\\nnext\",\"ecs.version\":\"8.6.0\"}")
+	if e.Format != ECS || e.Level != "INFO" || e.Message != "started\nnext" {
+		t.Errorf("colored: %v %q %q", e.Format, e.Level, e.Message)
+	}
+
+	// Nested ECS without a version, as some libraries write it.
+	e = Parse(`{"@timestamp":"2026-10-03T09:59:59Z","log":{"level":"WARN","logger":"x"},"message":"m"}`)
+	if e.Format != ECS || e.Level != "WARN" {
+		t.Errorf("nested: %v %q", e.Format, e.Level)
+	}
+
+	// An error entry without a message shows the error's.
+	e = Parse(`{"@timestamp":"2026-10-03T09:59:59Z","log.level":"error","error.message":"boom","ecs.version":"1.6.0"}`)
+	if e.Message != "boom" || e.Level != "ERROR" {
+		t.Errorf("error entry: %q %q", e.Level, e.Message)
+	}
+
+	// A dotted key colliding with a plain value is kept as written, whatever
+	// the map order.
+	for range 50 {
+		e = Parse(`{"@timestamp":"2026-10-03T09:59:59Z","log.level":"info","log":"text","ecs.version":"1.6.0"}`)
+		if e.Level != "INFO" || e.Message != "text" || e.Fields["log"] != "text" || e.Fields["log.level"] != "info" {
+			t.Fatalf("collision: %q %q %v", e.Level, e.Message, e.Fields)
+		}
+	}
+}
+
+func TestParseJSONVariants(t *testing.T) {
+	e := Parse(`{"level":50,"time":1759485600123456,"msg":"pino"}`)
+	if e.Level != "ERROR" || e.Time.Year() != 2025 {
+		t.Errorf("pino: %q %v", e.Level, e.Time)
+	}
+	e = Parse("\ufeff" + `{"msg":{"a":1}}`)
+	if e.Format != JSON || e.Message != `{"a":1}` {
+		t.Errorf("object message: %v %q", e.Format, e.Message)
+	}
+}
+
+func TestParsePlainColored(t *testing.T) {
+	e := Parse("2026-10-03T10:00:00Z \x1b[31mERROR\x1b[0m failed\x07")
+	if e.Level != "ERROR" || e.Message != "ERROR failed" || e.KubeTime.IsZero() {
+		t.Errorf("got %q %q %v", e.Level, e.Message, e.KubeTime)
+	}
+}
+
+func TestReadLine(t *testing.T) {
+	long := strings.Repeat("x", 300)
+	r := bufio.NewReaderSize(strings.NewReader("a\r\n"+long+"\n\nlast"), 16)
+	var got []string
+	for {
+		l, err := ReadLine(r, 100)
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			t.Fatal(err)
+		}
+		got = append(got, l)
+	}
+	want := []string{"a", long[:100], "", "last"}
+	if strings.Join(got, "|") != strings.Join(want, "|") {
+		t.Errorf("lines = %q", got)
 	}
 }

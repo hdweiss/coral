@@ -3,6 +3,7 @@ package ui
 import (
 	"context"
 	"slices"
+	"strings"
 	"testing"
 
 	"github.com/hdweiss/coral/internal/config"
@@ -59,5 +60,34 @@ func TestLogViewStreamsDemoLogs(t *testing.T) {
 	v.SetFilter("zzz-no-match")
 	if len(v.rows) != 0 || v.Selected() != nil {
 		t.Errorf("filter left %d rows", len(v.rows))
+	}
+}
+
+func TestLogViewTrims(t *testing.T) {
+	feed := func(v *logView, n int, line string) {
+		for range n / 1000 {
+			batch := make([]logs.Entry, 1000)
+			for i := range batch {
+				batch[i] = logs.Parse(line)
+			}
+			v.onLines(logLinesMsg{gen: v.gen, entries: batch})
+		}
+	}
+	pod := &unstructured.Unstructured{Object: map[string]any{}}
+
+	v := newLogView("c", pod, &config.Fields{})
+	v.rect = rect{0, 0, 100, 20}
+	feed(v, 22000, "short line")
+	if len(v.entries) != logMaxLines || len(v.rows) != logMaxLines || v.cursor != logMaxLines-1 {
+		t.Errorf("by lines: %d entries, %d rows, cursor %d", len(v.entries), len(v.rows), v.cursor)
+	}
+
+	v = newLogView("c", pod, &config.Fields{})
+	v.rect = rect{0, 0, 100, 20}
+	long := strings.Repeat("x", 64<<10)
+	feed(v, 1000, long)
+	want := logMaxBytes / len(long)
+	if len(v.entries) != want || v.bytes != want*len(long) || v.cursor != want-1 {
+		t.Errorf("by bytes: %d entries (want %d), %d bytes, cursor %d", len(v.entries), want, v.bytes, v.cursor)
 	}
 }

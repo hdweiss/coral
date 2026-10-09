@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"context"
 	"fmt"
+	"io"
 	"strings"
 
 	tea "charm.land/bubbletea/v2"
@@ -21,17 +22,19 @@ import (
 const logFieldsKind = "(logs)"
 
 const (
-	logTail     = 500   // lines fetched when a log opens
-	logMaxLines = 20000 // older lines are dropped beyond this
+	logTail      = 500      // lines fetched when a log opens
+	logMaxLines  = 20000    // older lines are dropped beyond this
+	logMaxBytes  = 32 << 20 // or beyond this much raw text
+	logMaxLineSz = 1 << 20  // longer lines are cut
 )
 
 // Messages of the log stream. gen ties them to one stream so that lines of a
 // stream that was replaced are dropped.
 type logLinesMsg struct {
-	gen   int
-	lines []string
-	done  bool
-	err   error
+	gen     int
+	entries []logs.Entry
+	done    bool
+	err     error
 }
 
 // logView shows a container log in place of the table. Each line shows the
@@ -48,6 +51,7 @@ type logView struct {
 	previous   bool
 
 	entries []logs.Entry
+	bytes   int   // raw text in entries
 	rows    []int // indices into entries that match the filter
 	filter  string
 	cursor  int
@@ -77,7 +81,7 @@ func newLogView(ctx string, pod *unstructured.Unstructured, fields *config.Field
 func (v *logView) start(p k8s.Provider) tea.Cmd {
 	v.stop()
 	v.gen++
-	v.entries, v.rows, v.cursor, v.offset = nil, nil, 0, 0
+	v.entries, v.bytes, v.rows, v.cursor, v.offset = nil, 0, nil, 0, 0
 	v.follow, v.loading, v.ended, v.err = true, true, false, nil
 	ctx, cancel := context.WithCancel(context.Background())
 	v.cancel = cancel
@@ -87,50 +91,65 @@ func (v *logView) start(p k8s.Provider) tea.Cmd {
 	}
 	gen, kctx := v.gen, v.ctx
 
-	// A goroutine reads lines into ch; readLogs hands them over in batches.
-	ch := make(chan string, 4096)
+	// A goroutine reads and parses lines into ch, off the UI goroutine since
+	// parsing JSON is the expensive part; read hands them over in batches. The
+	// first read only waits for the stream to open, so that an empty log
+	// shows as such instead of loading forever.
+	ch := make(chan logs.Entry, 4096)
+	opened := make(chan struct{})
 	var streamErr error
 	go func() {
 		defer close(ch)
 		r, err := p.Logs(ctx, kctx, req)
 		if err != nil {
 			streamErr = err
+			close(opened)
 			return
 		}
+		close(opened)
 		defer r.Close()
-		sc := bufio.NewScanner(r)
-		sc.Buffer(make([]byte, 64*1024), 4*1024*1024)
-		for sc.Scan() {
+		br := bufio.NewReaderSize(r, 64*1024)
+		for {
+			line, err := logs.ReadLine(br, logMaxLineSz)
+			if err != nil {
+				if err != io.EOF && ctx.Err() == nil {
+					streamErr = err
+				}
+				return
+			}
 			select {
-			case ch <- sc.Text():
+			case ch <- logs.Parse(line):
 			case <-ctx.Done():
 				return
 			}
 		}
-		if err := sc.Err(); err != nil && ctx.Err() == nil {
-			streamErr = err
-		}
 	}()
+	waitOpen := true
 	var read tea.Cmd
 	read = func() tea.Msg {
-		line, ok := <-ch
+		if waitOpen {
+			waitOpen = false
+			<-opened
+			return logLinesMsg{gen: gen}
+		}
+		e, ok := <-ch
 		if !ok {
 			return logLinesMsg{gen: gen, done: true, err: streamErr}
 		}
-		lines := []string{line}
-		for len(lines) < 2000 {
+		entries := []logs.Entry{e}
+		for len(entries) < 2000 {
 			select {
-			case line, ok := <-ch:
+			case e, ok := <-ch:
 				if !ok {
-					return logLinesMsg{gen: gen, lines: lines, done: true, err: streamErr}
+					return logLinesMsg{gen: gen, entries: entries, done: true, err: streamErr}
 				}
-				lines = append(lines, line)
+				entries = append(entries, e)
 				continue
 			default:
 			}
 			break
 		}
-		return logLinesMsg{gen: gen, lines: lines}
+		return logLinesMsg{gen: gen, entries: entries}
 	}
 	v.read = read
 	return read
@@ -149,17 +168,14 @@ func (v *logView) onLines(msg logLinesMsg) tea.Cmd {
 		return nil
 	}
 	v.loading = false
-	for _, l := range msg.lines {
-		v.entries = append(v.entries, logs.Parse(l))
+	for _, e := range msg.entries {
+		v.entries = append(v.entries, e)
+		v.bytes += len(e.Raw)
 		if v.matches(&v.entries[len(v.entries)-1]) {
 			v.rows = append(v.rows, len(v.entries)-1)
 		}
 	}
-	if drop := len(v.entries) - logMaxLines; drop > 1000 {
-		v.entries = append([]logs.Entry(nil), v.entries[drop:]...)
-		v.cursor = max(v.cursor-v.countRowsBelow(drop), 0)
-		v.rebuild()
-	}
+	v.trim()
 	if v.follow {
 		v.cursor = max(len(v.rows)-1, 0)
 	}
@@ -169,6 +185,27 @@ func (v *logView) onLines(msg logLinesMsg) tea.Cmd {
 		return nil
 	}
 	return v.read
+}
+
+// trim drops the oldest entries once there are more than logMaxLines or
+// logMaxBytes. It waits until the buffer is well over a limit, so that the
+// copy happens once per a few thousand lines rather than on every batch.
+func (v *logView) trim() {
+	if len(v.entries) <= logMaxLines+1000 && v.bytes <= logMaxBytes+logMaxBytes/8 {
+		return
+	}
+	drop, bytes := 0, v.bytes
+	for drop < len(v.entries)-1 && (len(v.entries)-drop > logMaxLines || bytes > logMaxBytes) {
+		bytes -= len(v.entries[drop].Raw)
+		drop++
+	}
+	if drop == 0 {
+		return
+	}
+	v.entries = append([]logs.Entry(nil), v.entries[drop:]...)
+	v.bytes = bytes
+	v.cursor = max(v.cursor-v.countRowsBelow(drop), 0)
+	v.rebuild()
 }
 
 // countRowsBelow counts the rows pointing at entries before index i.
@@ -307,6 +344,8 @@ func (v *logView) View() string {
 		lines = append(lines, stMuted.Render(" loading…"))
 	case len(v.rows) == 0 && v.filter != "":
 		lines = append(lines, stMuted.Render(" no lines match “"+v.filter+"”"))
+	case len(v.rows) == 0 && !v.ended:
+		lines = append(lines, stMuted.Render(" waiting for log lines…"))
 	case len(v.rows) == 0:
 		lines = append(lines, stMuted.Render(" no log lines"))
 	}
