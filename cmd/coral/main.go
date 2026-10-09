@@ -74,6 +74,9 @@ func rootCmd() *cobra.Command {
 			opts.Version = version
 			opts.PinsPath = config.PinsPath(demo)
 			opts.FieldsPath = config.FieldsPath()
+			if opts.Settings, err = config.LoadSettings(config.SettingsPath()); err != nil {
+				return fmt.Errorf("%s: %w", config.SettingsPath(), err)
+			}
 			store := k8s.NewStore(p, timeout)
 			if !demo {
 				store.SetCacheDir(cacheDir)
@@ -94,6 +97,7 @@ func rootCmd() *cobra.Command {
 	f.DurationVar(&opts.Refresh, "refresh", 10*time.Second, "background refresh interval of the visible list (0 disables)")
 	f.DurationVar(&timeout, "timeout", 30*time.Second, "timeout for API requests")
 	f.BoolVar(&demo, "demo", false, "use a built-in fake cluster")
+	f.BoolVar(&opts.ReadOnly, "readonly", false, "refuse every change (also per context: readonly patterns in config.yaml)")
 	f.StringVar(&traceAPI, "trace-api", "", "append every API request to this file (time, verb, path, status, bytes, duration)")
 	f.StringVar(&themeSpec, "theme", envOr("CORALCTL_THEME", "auto"),
 		`colors: "auto" (Omarchy's when installed, else coral), "omarchy", a built-in theme (`+strings.Join(theme.Names(), ", ")+`), or a path to an Omarchy colors.toml or theme directory ($CORALCTL_THEME)`)

@@ -15,7 +15,6 @@ import (
 	"github.com/hdweiss/coral/internal/k8s"
 	"github.com/hdweiss/coral/internal/schema"
 	"github.com/hdweiss/coral/internal/theme"
-	"github.com/hdweiss/coral/internal/yamltree"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/util/duration"
 )
@@ -29,6 +28,8 @@ type Options struct {
 	PinsPath      string        // where pins are saved; "" keeps them in memory only
 	FieldsPath    string        // where favorite and hidden fields are saved; "" keeps them in memory only
 	Theme         *theme.Source // colors, reloaded when they change; nil keeps the built-in palette
+	ReadOnly      bool          // refuse every change, in every context
+	Settings      config.Settings
 }
 
 type focusID int
@@ -97,6 +98,7 @@ type App struct {
 	zoom          bool
 
 	palette       *palette
+	confirm       *confirm
 	picker        *picker
 	pickTarget    addTarget
 	editing       *editState
@@ -799,6 +801,14 @@ func (a *App) handleKey(msg tea.KeyPressMsg) tea.Cmd {
 		return tea.Quit
 	}
 
+	if a.confirm != nil {
+		done, cmd := a.confirm.Update(msg)
+		if done {
+			a.confirm = nil
+		}
+		return cmd
+	}
+
 	if a.picker != nil {
 		cmd, done, res := a.picker.Update(msg)
 		if done {
@@ -813,10 +823,7 @@ func (a *App) handleKey(msg tea.KeyPressMsg) tea.Cmd {
 	if a.palette != nil {
 		cmd, done, run := a.palette.Update(msg)
 		if done {
-			a.palette = nil
-			if run != "" {
-				return a.runCommand(run)
-			}
+			return a.closePalette(run)
 		}
 		return cmd
 	}
@@ -841,7 +848,19 @@ func (a *App) handleKey(msg tea.KeyPressMsg) tea.Cmd {
 		return nil
 	}
 
+	// Actions on the selected object (see actions.go). The log view has
+	// its own meaning for some of their keys.
+	if a.focus != focusNav && a.logs == nil {
+		if cmd, ok := a.actionKey(key); ok {
+			return cmd
+		}
+	}
+
 	switch key {
+	case ".":
+		if a.focus != focusNav {
+			return a.openActionMenu()
+		}
 	case "q":
 		return tea.Quit
 	case ":":
@@ -889,24 +908,6 @@ func (a *App) handleKey(msg tea.KeyPressMsg) tea.Cmd {
 		if a.focus != focusNav {
 			return a.openDescribe(false)
 		}
-	case "e":
-		if a.logs != nil {
-			return nil // log entries are not objects
-		}
-		switch a.focus {
-		case focusTable:
-			return a.startEdit(nil)
-		case focusDetail:
-			var focus []yamltree.Seg
-			if n := a.detail.current(); n != nil {
-				focus = n.Segments()
-			}
-			return a.startEdit(focus)
-		}
-	case "ctrl+n":
-		if a.logs == nil && (a.focus == focusTable || a.focus == focusDetail) {
-			return a.startAdd()
-		}
 	case "R":
 		a.toggleLive()
 		return nil
@@ -931,10 +932,6 @@ func (a *App) handleKey(msg tea.KeyPressMsg) tea.Cmd {
 		a.zoom = !a.zoom
 		a.layout()
 		return nil
-	case "o":
-		if a.focus == focusTable && !a.subview() && a.table.res.ID() == "customresourcedefinitions" {
-			return a.openInstances()
-		}
 	case "esc":
 		switch {
 		case a.focus == focusDetail && a.detail.info.on:
@@ -1125,6 +1122,9 @@ func (a *App) handleMouse(msg tea.MouseMsg) tea.Cmd {
 	m := msg.Mouse()
 	switch msg.(type) {
 	case tea.MouseClickMsg:
+		if m.Button == tea.MouseRight {
+			return a.rightClick(m.X, m.Y)
+		}
 		if m.Button != tea.MouseLeft {
 			return nil
 		}
@@ -1134,6 +1134,13 @@ func (a *App) handleMouse(msg tea.MouseMsg) tea.Cmd {
 			a.lastClick.t = time.Time{} // a third click starts over
 		}
 
+		if a.confirm != nil {
+			done, cmd := a.confirm.Click(m.X, m.Y)
+			if done {
+				a.confirm = nil
+			}
+			return cmd
+		}
 		if a.picker != nil {
 			done, res := a.picker.Click(m.X, m.Y)
 			if done {
@@ -1147,10 +1154,7 @@ func (a *App) handleMouse(msg tea.MouseMsg) tea.Cmd {
 		if a.palette != nil {
 			done, run := a.palette.Click(m.X, m.Y)
 			if done {
-				a.palette = nil
-				if run != "" {
-					return a.runCommand(run)
-				}
+				return a.closePalette(run)
 			}
 			return nil
 		}
@@ -1204,6 +1208,9 @@ func (a *App) handleMouse(msg tea.MouseMsg) tea.Cmd {
 		case tea.MouseWheelDown:
 			delta = 3
 		}
+		if a.confirm != nil {
+			return nil
+		}
 		if a.picker != nil {
 			a.picker.Wheel(delta / 3)
 			return nil
@@ -1223,6 +1230,23 @@ func (a *App) handleMouse(msg tea.MouseMsg) tea.Cmd {
 		}
 	}
 	return nil
+}
+
+// rightClick on a row of the table or describe view selects it and opens
+// the action menu.
+func (a *App) rightClick(x, y int) tea.Cmd {
+	if a.picker != nil || a.palette != nil || a.confirm != nil || a.logs != nil {
+		return nil
+	}
+	r := a.table.rect
+	if !r.inner().contains(x, y) {
+		return nil
+	}
+	a.setFocus(focusTable)
+	in := r.inner()
+	a.mainUpdate(clickMsg{x: x - in.x, y: y - in.y})
+	a.syncDetail()
+	return a.openActionMenu()
 }
 
 type panelRef struct {
@@ -1355,6 +1379,20 @@ func (a *App) openPalette(initial string) tea.Cmd {
 	return a.palette.input.Focus()
 }
 
+// closePalette closes the palette and runs what was picked: an item that
+// runs itself (action menu), or a command.
+func (a *App) closePalette(run string) tea.Cmd {
+	p := a.palette
+	a.palette = nil
+	if it := p.item(run); it != nil {
+		return it.run()
+	}
+	if run != "" && p.title == "Command" {
+		return a.runCommand(run)
+	}
+	return nil
+}
+
 func (a *App) runCommand(text string) tea.Cmd {
 	f := strings.Fields(text)
 	if len(f) == 0 {
@@ -1455,6 +1493,9 @@ func (a *App) View() tea.View {
 		content = a.overlayInfo(content)
 	}
 	switch {
+	case a.confirm != nil:
+		box := a.confirm.View(a.w, a.h)
+		content = overlay(content, box, a.confirm.rect.x, a.confirm.rect.y)
 	case a.picker != nil:
 		box := a.picker.View(a.w, a.h)
 		content = overlay(content, box, a.picker.rect.x, a.picker.rect.y)
@@ -1528,6 +1569,10 @@ func (a *App) renderHeader() string {
 	seg(stLogo.Render(" coral "), nil)
 	seg(stBar.Render(" "), nil)
 	seg(stBar.Bold(true).Render("⎈ "+a.ctx), func() tea.Cmd { return a.openPalette("ctx ") })
+	if a.readOnly() {
+		seg(stBar.Render(" "), nil)
+		seg(stBar.Foreground(colRed).Bold(true).Render("read-only"), nil)
+	}
 	if a.table.res.Namespaced {
 		ns := a.ns
 		if ns == "" {
@@ -1638,18 +1683,21 @@ func (a *App) renderStatus() string {
 			if a.logPod() != nil {
 				hints = append(hints, hint{"L", "logs", a.openLogs})
 			}
-			hints = append(hints, hint{"e", "edit", func() tea.Cmd { return a.startEdit(nil) }})
+			if !a.readOnly() {
+				hints = append(hints, hint{"e", "edit", func() tea.Cmd { return a.startEdit(nil) }})
+			}
+			hints = append(hints, hint{".", "actions", a.openActionMenu})
 			break
 		}
-		if a.table.res.ID() == "pods" {
-			hints = append(hints, hint{"L", "logs", a.openLogs})
+		obj := a.table.Selected()
+		for _, act := range a.actionsFor(a.table.res) {
+			if act.key == "p" {
+				continue // L is enough for the status bar
+			}
+			act := act
+			hints = append(hints, hint{keyLabel(act.key), act.label, func() tea.Cmd { return a.runAction(act, obj) }})
 		}
-		if a.table.res.ID() == "customresourcedefinitions" {
-			hints = append(hints, hint{"o", "instances", a.openInstances})
-		}
-		hints = append(hints, describe, events,
-			hint{"e", "edit", func() tea.Cmd { return a.startEdit(nil) }},
-			hint{"^n", "add", a.startAdd},
+		hints = append(hints, hint{".", "actions", a.openActionMenu},
 			hint{"s", "sort", press(a.table.Update, plainKey('s'))})
 	case focusDetail:
 		if a.logs != nil {
@@ -1659,9 +1707,12 @@ func (a *App) renderStatus() string {
 				hint{"C", "collapse all", press(a.detail.Update, plainKey('C'))})
 			break
 		}
+		if !a.readOnly() {
+			hints = append(hints,
+				hint{"e", "edit", func() tea.Cmd { return a.handleKey(plainKey('e')) }},
+				hint{"^n", "add", a.startAdd})
+		}
 		hints = append(hints,
-			hint{"e", "edit", func() tea.Cmd { return a.handleKey(plainKey('e')) }},
-			hint{"^n", "add", a.startAdd},
 			hint{"i", "info", press(a.detail.Update, plainKey('i'))},
 			hint{"^p", "favorite", press(a.detail.Update, ctrlKey('p'))},
 			hint{"^x", "hide", press(a.detail.Update, ctrlKey('x'))},
@@ -1710,6 +1761,7 @@ func helpView(w, h int) string {
 			{"z", "zoom the focused panel"},
 			{"r ctrl+r", "refresh"},
 			{"R", "live: watch the visible list for changes instead of refreshing it"},
+			{". right-click", "actions for the selected object"},
 			{"esc", "back / clear filter / unzoom"},
 			{"q", "quit"},
 		}},

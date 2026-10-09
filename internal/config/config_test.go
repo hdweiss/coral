@@ -1,6 +1,7 @@
 package config
 
 import (
+	"os"
 	"path/filepath"
 	"slices"
 	"testing"
@@ -44,5 +45,26 @@ func TestFieldsRoundTrip(t *testing.T) {
 	g.SetHidden("Pod", ".spec.nodeName", false)
 	if len(g.Kinds) != 0 {
 		t.Fatalf("empty kinds should be pruned: %+v", g.Kinds)
+	}
+}
+
+func TestSettings(t *testing.T) {
+	p := filepath.Join(t.TempDir(), "config.yaml")
+	if s, err := LoadSettings(p); err != nil || len(s.ReadOnly) != 0 {
+		t.Fatalf("missing file: %+v %v", s, err)
+	}
+	os.WriteFile(p, []byte("readonly:\n  - \"*prod*\"\n  - staging\n"), 0o600)
+	s, err := LoadSettings(p)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for ctx, want := range map[string]bool{"eu-prod-1": true, "staging": true, "staging-2": false, "dev": false} {
+		if s.IsReadOnly(ctx) != want {
+			t.Errorf("IsReadOnly(%q) = %v", ctx, !want)
+		}
+	}
+	os.WriteFile(p, []byte("readonlee: [x]\n"), 0o600)
+	if _, err := LoadSettings(p); err == nil {
+		t.Error("a misspelt key was accepted")
 	}
 }

@@ -70,6 +70,9 @@ func (a *App) selection() (k8s.Key, *unstructured.Unstructured) {
 // startEdit opens the selected object in the editor, with the cursor on
 // focus when it is given.
 func (a *App) startEdit(focus []yamltree.Seg) tea.Cmd {
+	if a.refuseWrite() {
+		return nil
+	}
 	key, obj := a.selection()
 	if obj == nil {
 		a.setFlash("nothing selected to edit", true)
@@ -206,6 +209,9 @@ func (a *App) schemaSource(ctx string) schema.Source {
 // startAdd opens the "add field" dialog below the selected node of the
 // detail view, or at the top level of the object from the table.
 func (a *App) startAdd() tea.Cmd {
+	if a.refuseWrite() {
+		return nil
+	}
 	key, obj := a.selection()
 	if obj == nil {
 		a.setFlash("nothing selected", true)

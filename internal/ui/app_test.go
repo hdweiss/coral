@@ -2,10 +2,13 @@ package ui
 
 import (
 	"context"
+	"slices"
+	"strings"
 	"testing"
 	"time"
 
 	tea "charm.land/bubbletea/v2"
+	"github.com/hdweiss/coral/internal/config"
 	"github.com/hdweiss/coral/internal/k8s"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 )
@@ -121,5 +124,80 @@ func TestLiveWatchesVisibleList(t *testing.T) {
 	a.Update(tea.KeyPressMsg{Code: 'R', Text: "R"})
 	if len(a.watches) != 0 {
 		t.Error("watches left running after live mode was switched off")
+	}
+}
+
+func showPods(t *testing.T, a *App) {
+	t.Helper()
+	a.Init()
+	e := a.store.Fetch(a.cur)
+	a.Update(fetchedMsg{key: a.cur, entry: e})
+	if a.table.Selected() == nil {
+		t.Fatal("no pod selected")
+	}
+}
+
+func TestReadOnlyRefusesWrites(t *testing.T) {
+	a := newTestApp(t, Options{Settings: config.Settings{ReadOnly: []string{"demo-*"}}})
+	showPods(t, a)
+	a.Update(tea.KeyPressMsg{Code: 'e', Text: "e"})
+	if a.editing != nil || !strings.Contains(a.flash, "read-only") {
+		t.Errorf("edit in a read-only context: flash %q", a.flash)
+	}
+	for _, act := range a.actionsFor(a.table.res) {
+		if act.write {
+			t.Errorf("%s offered in a read-only context", act.label)
+		}
+	}
+	if !strings.Contains(a.View().Content, "read-only") {
+		t.Error("the header doesn't say read-only")
+	}
+}
+
+func TestActionMenu(t *testing.T) {
+	a := newTestApp(t, Options{})
+	showPods(t, a)
+	a.Update(tea.KeyPressMsg{Code: '.', Text: "."})
+	if a.palette == nil {
+		t.Fatal("no action menu")
+	}
+	var labels []string
+	for _, it := range a.palette.items {
+		labels = append(labels, it.cmd)
+	}
+	for _, want := range []string{"logs", "describe", "edit"} {
+		if !slices.Contains(labels, want) {
+			t.Errorf("menu %v lacks %s", labels, want)
+		}
+	}
+	if slices.Contains(labels, "instances") {
+		t.Error("a pod offers the CRD action")
+	}
+	for _, r := range "describe" {
+		a.Update(tea.KeyPressMsg{Code: r, Text: string(r)})
+	}
+	a.Update(tea.KeyPressMsg{Code: tea.KeyEnter})
+	if a.palette != nil || a.desc == nil {
+		t.Error("picking describe from the menu didn't open it")
+	}
+}
+
+func TestConfirm(t *testing.T) {
+	ran := 0
+	opt := &confirmOption{key: "p", label: "propagation", values: []string{"Background", "Foreground"}}
+	c := newConfirm("Delete", "Delete", true, []string{"pod x"}, func(c *confirm) tea.Cmd {
+		ran++
+		return nil
+	}, opt)
+	c.View(100, 40)
+	if done, _ := c.Update(tea.KeyPressMsg{Code: tea.KeyEnter}); !done || ran != 0 {
+		t.Error("enter on a destructive dialog should cancel")
+	}
+	c.Update(tea.KeyPressMsg{Code: 'p', Text: "p"})
+	if opt.value() != "Foreground" {
+		t.Error("p didn't cycle the option")
+	}
+	if done, _ := c.Update(tea.KeyPressMsg{Code: 'y', Text: "y"}); !done || ran != 1 {
+		t.Error("y didn't confirm")
 	}
 }

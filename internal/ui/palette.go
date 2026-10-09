@@ -14,6 +14,7 @@ type paletteItem struct {
 	cmd     string
 	desc    string
 	aliases []string
+	run     func() tea.Cmd // runs the item instead of the command text (action menu)
 }
 
 // palette is the ":" command palette: a text input with ranked suggestions.
@@ -23,6 +24,7 @@ type palette struct {
 	matches []paletteItem
 	cursor  int
 	offset  int
+	title   string
 	rect    rect // absolute position of the box, set when rendered
 }
 
@@ -36,7 +38,7 @@ func newPalette(items []paletteItem, initial string) *palette {
 	ti.SetValue(initial)
 	ti.CursorEnd()
 	ti.Focus()
-	p := &palette{input: ti, items: items}
+	p := &palette{input: ti, items: items, title: "Command"}
 	p.filter()
 	return p
 }
@@ -83,6 +85,16 @@ func matchScore(q string, it paletteItem) int {
 		return 3
 	}
 	return -1
+}
+
+// item returns the item with command cmd, for items that run themselves.
+func (p *palette) item(cmd string) *paletteItem {
+	for i := range p.items {
+		if p.items[i].cmd == cmd && p.items[i].run != nil {
+			return &p.items[i]
+		}
+	}
+	return nil
 }
 
 // selected returns the command to run on enter.
@@ -167,7 +179,7 @@ func (p *palette) View(screenW int) string {
 	if len(p.matches) > paletteRows {
 		footer = "↑↓ more"
 	}
-	box := frame("Command", footer, lines, w, len(lines)+2, true)
+	box := frame(p.title, footer, lines, w, len(lines)+2, true)
 	p.rect = rect{(screenW - w) / 2, 2, w, lipgloss.Height(box)}
 	return box
 }

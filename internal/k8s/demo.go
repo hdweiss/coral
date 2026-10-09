@@ -17,6 +17,7 @@ import (
 	"k8s.io/client-go/dynamic"
 	dynamicfake "k8s.io/client-go/dynamic/fake"
 	"k8s.io/client-go/openapi"
+	"k8s.io/client-go/rest"
 	k8stesting "k8s.io/client-go/testing"
 )
 
@@ -73,6 +74,8 @@ func (p *demoProvider) DefaultNamespace(string) string { return "shop" }
 func (p *demoProvider) OpenAPI(string) (openapi.Client, error) {
 	return nil, errors.New("the demo clusters have no OpenAPI document")
 }
+func (p *demoProvider) Kubectl(string) ([]string, error)        { return nil, ErrDemo }
+func (p *demoProvider) RESTConfig(string) (*rest.Config, error) { return nil, ErrDemo }
 func (p *demoProvider) Client(ctx string) (dynamic.Interface, error) {
 	if c, ok := p.clients[ctx]; ok {
 		return c, nil

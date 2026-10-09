@@ -6,7 +6,7 @@ Every feature has to work in `--demo`, since there is no real cluster in the dev
 
 ## Phase 0: foundations for actions
 
-Coral can browse and edit but cannot act on objects. Before adding actions one by one, build the plumbing they share.
+Done (see status.md): `Provider.Kubectl`/`RESTConfig` (no typed client yet; add one with the first feature that needs it), the action registry, the action menu (`.` / right-click), the confirm dialog, and read-only mode (`--readonly`, `readonly:` patterns in `config.yaml`). The original notes:
 
 - **Typed client and REST config in `Provider`.** Exec, port-forward and metrics need more than the dynamic client. Logs went in as a narrow `Provider.Logs` (the kube provider caches a typed clientset per context); the rest can follow that pattern or add `Clientset(ctx)` and `RESTConfig(ctx)`. The demo uses `k8s.io/client-go/kubernetes/fake` seeded with the same objects, and returns an error for `RESTConfig`, so features that need it can say "not in demo mode".
 - **Action registry.** Per kind, a list of `{key, label, run, needsWrite}`, e.g. pods: logs, shell, delete, kill, port-forward. The table, the detail panel, the status-bar hints and the help overlay all read from it, so a new action shows up everywhere at once.

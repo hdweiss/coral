@@ -31,7 +31,16 @@ type Provider interface {
 	// Logs streams a container's log, each line prefixed with its RFC3339Nano
 	// timestamp. Closing the reader or cancelling ctx ends the stream.
 	Logs(ctx context.Context, context string, req LogRequest) (io.ReadCloser, error)
+	// Kubectl returns the arguments that point kubectl at a context
+	// (--context, and --kubeconfig when one was given), or ErrDemo.
+	Kubectl(context string) ([]string, error)
+	// RESTConfig returns a context's REST config, for clients beyond the
+	// dynamic one (port-forward, metrics), or ErrDemo.
+	RESTConfig(context string) (*rest.Config, error)
 }
+
+// ErrDemo is returned for what the demo clusters can't do.
+var ErrDemo = errors.New("not available in demo mode")
 
 type kubeProvider struct {
 	rules *clientcmd.ClientConfigLoadingRules
@@ -163,6 +172,24 @@ func (p *kubeProvider) OpenAPI(context string) (openapi.Client, error) {
 	c := dc.OpenAPIV3()
 	p.openapi[context] = c
 	return c, nil
+}
+
+func (p *kubeProvider) Kubectl(context string) ([]string, error) {
+	args := []string{"--context", context}
+	if p.rules.ExplicitPath != "" {
+		args = append(args, "--kubeconfig", p.rules.ExplicitPath)
+	}
+	return args, nil
+}
+
+func (p *kubeProvider) RESTConfig(context string) (*rest.Config, error) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	rc, err := p.config(context)
+	if err != nil {
+		return nil, err
+	}
+	return rest.CopyConfig(rc), nil
 }
 
 func (p *kubeProvider) clientset(context string) (kubernetes.Interface, error) {
