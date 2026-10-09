@@ -1,6 +1,6 @@
 # Status
 
-Handoff notes for picking the work back up. Last updated 2026-10-04 (network traffic and custom resources).
+Handoff notes for picking the work back up. Last updated 2026-10-09 (live mode, phase 0 and 1: actions, read-only, shell, delete, logs, describe details).
 
 ## What exists
 

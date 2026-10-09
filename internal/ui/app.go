@@ -1915,9 +1915,15 @@ func helpView(w, h int) string {
 			{"z", "zoom the focused panel"},
 			{"r ctrl+r", "refresh"},
 			{"R", "live: watch the visible list for changes instead of refreshing it"},
-			{". right-click", "actions for the selected object"},
+			{". right-click", "actions for the selected object (the ones below, and more)"},
 			{"esc", "back / clear filter / unzoom"},
 			{"q", "quit"},
+		}},
+		{"Actions", [][2]string{
+			{"s a", "pod: shell (kubectl exec) / attach, picking the container"},
+			{"ctrl+d ctrl+k", "delete (propagation, grace period) / kill a pod, after asking"},
+			{"e ctrl+n", "edit in $EDITOR / add a field from the API schema"},
+			{"--readonly", "or readonly patterns in config.yaml: no changes, header says read-only"},
 		}},
 		{"Lists and trees", [][2]string{
 			{"↑↓ j k", "move"},
@@ -1927,14 +1933,12 @@ func helpView(w, h int) string {
 			{"y", "table: go to the YAML details"},
 			{"shift+letter", "table: sort by the column with that letter underlined (again to reverse; k9s: N name, A age, S status…)"},
 			{"o", "CRDs list: open the selected CRD's instances (also double-click)"},
-			{"e", "edit the object in $EDITOR (at the selected field)"},
-			{"ctrl+n", "add a field below the selected one, from the API schema"},
 			{"ctrl+p ctrl+x", "details: favorite (to the top) / hide (to the bottom)"},
 			{"O C", "details: expand all / collapse all"},
 			{"i", "details: toggle help for the selected field"},
 		}},
 		{"Logs", [][2]string{
-			{"L", "show the selected pod's log (again or esc to close)"},
+			{"L", "the selected pod's log, or all pods of a workload (again or esc to close)"},
 			{"p", "previous container's log (on a pod, or toggle in the log)"},
 			{"enter", "show the selected line as a tree (JSON / ECS fields)"},
 			{"ctrl+p", "pin a field of the selected line to this app's lines (in the entry view: the selected field)"},
@@ -1980,8 +1984,15 @@ func helpView(w, h int) string {
 	if len(lines)+2 <= h || w < 2*colW+2 {
 		return frame("Help", "any key to close", lines, 76, len(lines)+2, true)
 	}
-	// Two columns when one does not fit the screen.
-	left, right := render(sections[:2]), render(sections[2:])
+	// Two columns when one does not fit the screen, split between sections
+	// where they are closest in height.
+	split := 1
+	for i := 1; i < len(sections); i++ {
+		if max(len(render(sections[:i])), len(render(sections[i:]))) < max(len(render(sections[:split])), len(render(sections[split:]))) {
+			split = i
+		}
+	}
+	left, right := render(sections[:split]), render(sections[split:])
 	lines = lines[:0]
 	for i := range max(len(left), len(right)) {
 		var l, r string

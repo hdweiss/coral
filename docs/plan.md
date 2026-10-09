@@ -20,9 +20,8 @@ What people reach for k9s for most of the time.
 
 - **Logs.** Done (see status.md): `L` on a pod or workload (pods merged and labelled), all containers merged, ECS/JSON/logfmt parsing, entry tree, per-app fields pinned to lines (also from the line view), follow, filter, search, wrap, time toggle, 0–6 ranges, save, containers, previous. Still open:
   - A workload's log view follows its pod set (pods replaced by a rollout); today it is fixed when opened.
-- **Shell / attach (`s` / `a` on pods).** Run `kubectl exec -it` (and `kubectl attach`) through `tea.ExecProcess`, the same way `$EDITOR` runs. This is what k9s does and avoids SPDY handling in-process. Pick the container first, try `bash` then `sh`. Pass `--context` and `--kubeconfig`. Demo: run `$SHELL` with a banner saying it is fake.
-  - `a` is free (add field moved to `ctrl+n`). `s` is still table sort, so shell needs `s` freed (sort to shift+letter like k9s) or another key.
-- **Delete and kill (`ctrl+d` / `ctrl+k`).** Confirm dialog with the object name; options for cascade (background/foreground/orphan) and grace period. Kill is delete with grace period 0. The table keeps its cursor on the next row. Demo: the fake tracker already supports delete; also re-create pods owned by a ReplicaSet so it feels real.
+- **Shell / attach (`s` / `a` on pods).** Done (see status.md): `kubectl exec -it` / `kubectl attach -it` through `tea.ExecProcess`; sorting moved to k9s's shift+letter to free `s`. Still open: not tested against a real cluster from the dev environment (no kubectl there).
+- **Delete and kill (`ctrl+d` / `ctrl+k`).** Done (see status.md), with the demo recreating controller-owned pods.
 - **Events.** Done (see status.md): an `events` resource directly under each namespace in the navigator (LAST SEEN, TYPE, REASON, OBJECT, COUNT, MESSAGE, newest first, warnings in red); `E` lists the selected object's events in place of the table; a red `⚠N` after the name marks rows with Warning events in the last hour (click it for the events). Still open:
   - Watch events instead of polling them with the list refresh. Done for the ⚠ markers in live mode (`R`); the describe view still polls.
   - Done: server-side field selectors for `E` (network.md item 10), the rollout timeline in `E`/`d` for controllers, ⚠ counts per namespace in the navigator (live mode).
@@ -79,5 +78,4 @@ From the brainstorm and earlier sessions; these are what set coral apart from k9
 ## Open questions
 
 - Key for drill-down, given `enter` focuses the detail panel today.
-- Key for shell, given `s` is sort in the table.
-- Whether to depend on `kubectl` at all (exec, attach, describe) or do everything in-process. Shelling out is simpler and matches k9s; in-process works without kubectl installed.
+- Decided 2026-10-09: shell is `s` (sort moved to shift+letter, as in k9s); exec and attach shell out to `kubectl`; describe's details are coral's own (`k8s.Details`), so they need no kubectl.
