@@ -242,8 +242,9 @@ func (d *demo) customResources(prod bool) {
 	})
 	for _, sm := range []struct{ ns, name string }{{"monitoring", "frontend"}, {"shop", "cart"}, {"monitoring", "kube-state-metrics"}} {
 		d.add(mon+"/v1", "ServiceMonitor", sm.ns, sm.name, 40*day, map[string]string{"release": "k8s"}, m{"spec": m{
-			"selector":  m{"matchLabels": m{"app": sm.name}},
-			"endpoints": l{m{"port": "http", "interval": "30s"}},
+			"selector":          m{"matchLabels": m{"app": sm.name}},
+			"namespaceSelector": m{"matchNames": l{"shop"}},
+			"endpoints":         l{m{"port": "http", "interval": "30s"}},
 		}})
 	}
 	d.add(mon+"/v1", "PrometheusRule", "monitoring", "shop-alerts", 40*day, nil, m{"spec": m{"groups": l{m{

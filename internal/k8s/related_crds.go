@@ -121,6 +121,63 @@ func (r *relator) customRelations(res Resource) {
 			r.add("Gateways", out)
 		}
 		r.add("Services", r.byName("services", r.ns, routeBackends(obj), "backend"))
+	default:
+		r.genericRelations()
+	}
+}
+
+// genericRelations reads the conventions many custom resources follow, for
+// those without relations of their own: a label selector (spec.selector,
+// spec.podSelector) picks pods and services (a ServiceMonitor's picks
+// services, a PodMonitor's pods), in the namespaces spec.namespaceSelector
+// names (matchNames, or any) or else its own; and a target reference
+// (spec.scaleTargetRef as in KEDA, spec.targetRef as in VPA) names one
+// object.
+func (r *relator) genericRelations() {
+	if r.obj.GetNamespace() == "" {
+		return
+	}
+	namespaces := []string{r.ns}
+	if names, ok, _ := unstructured.NestedStringSlice(r.obj.Object, "spec", "namespaceSelector", "matchNames"); ok && len(names) > 0 {
+		namespaces = names
+	}
+	if any, _, _ := unstructured.NestedBool(r.obj.Object, "spec", "namespaceSelector", "any"); any {
+		namespaces = []string{""}
+	}
+	for _, f := range []string{"selector", "podSelector"} {
+		sel, err := labelSelector(r.obj, "spec", f)
+		if err != nil || sel.Empty() {
+			continue
+		}
+		var pods, svcs []Related
+		for _, ns := range namespaces {
+			for _, p := range r.pods(sel, ns) {
+				p.Note = podNote(p.Obj, ns != r.ns)
+				pods = append(pods, p)
+			}
+			items := r.items("services", ns)
+			for i := range items {
+				if sel.Matches(labels.Set(items[i].GetLabels())) {
+					note := ""
+					if items[i].GetNamespace() != r.ns {
+						note = items[i].GetNamespace()
+					}
+					svcs = append(svcs, related(MustLookup("services"), &items[i], note))
+				}
+			}
+		}
+		r.add("Selected pods", pods)
+		r.add("Selected services", svcs)
+		break
+	}
+	for _, f := range []string{"scaleTargetRef", "targetRef"} {
+		kind, name := str(r.obj, "spec", f, "kind"), str(r.obj, "spec", f, "name")
+		if kind == "" || name == "" {
+			continue
+		}
+		if res, ok := r.reg.ForKind(str(r.obj, "spec", f, "apiVersion"), kind); ok {
+			r.add("Target", r.byRes(res, r.ns, []string{name}, ""))
+		}
 	}
 }
 

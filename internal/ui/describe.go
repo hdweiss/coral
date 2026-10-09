@@ -20,6 +20,7 @@ const (
 	descInfo                      // a message such as "no events", not selectable
 	descObject
 	descEvent
+	descField // a line of the subject's details (k8s.Details), not selectable
 )
 
 type descRow struct {
@@ -28,6 +29,7 @@ type descRow struct {
 	rel  k8s.Related // descObject
 	self bool        // the described object itself, on top
 	ev   *unstructured.Unstructured
+	f    k8s.Field // descField
 }
 
 func (r descRow) selectable() bool { return r.kind == descObject || r.kind == descEvent }
@@ -79,7 +81,8 @@ type describeMsg struct {
 	rels     []k8s.Relation
 	keepRels bool // only the events were loaded
 	events   []*unstructured.Unstructured
-	timeline bool // the events include those of owned objects
+	timeline bool                       // the events include those of owned objects
+	subject  *unstructured.Unstructured // the subject as cached now, if found
 	err      error
 }
 
@@ -101,8 +104,19 @@ func (v *describeView) load(store *k8s.Store, maxAge time.Duration, withRels boo
 	// What the subject owns changes less often than its events; the tick's
 	// event refresh needn't relist pods and replica sets each time.
 	ownedList := store.Lister(ctx, max(maxAge, 30*time.Second))
+	// The details show the subject's state, so take its latest copy from
+	// the cache (no request: live mode or the table keep it current).
+	var fresh *unstructured.Unstructured
+	key := k8s.Key{Context: ctx, GVR: v.res.GVR(), Namespace: obj.GetNamespace()}
+	if e, ok := store.Get(key); ok && v.res.Name != "" {
+		for i := range e.Items {
+			if e.Items[i].GetUID() == obj.GetUID() {
+				fresh = &e.Items[i]
+			}
+		}
+	}
 	return func() tea.Msg {
-		msg := describeMsg{view: v, gen: gen, keepRels: !withRels}
+		msg := describeMsg{view: v, gen: gen, keepRels: !withRels, subject: fresh}
 		var relErr error
 		if withRels {
 			msg.rels, relErr = k8s.Relations(rel, reg, obj)
@@ -134,6 +148,9 @@ func (v *describeView) onLoaded(msg describeMsg) {
 		v.rels = msg.rels
 	}
 	v.events, v.err, v.timeline = msg.events, msg.err, msg.timeline
+	if msg.subject != nil {
+		v.subject = msg.subject
+	}
 	v.rebuild()
 }
 
@@ -155,6 +172,18 @@ func (v *describeView) rebuild() {
 			Res: v.res, Obj: v.subject, Kind: v.subject.GetKind(), Name: v.subject.GetName(),
 			Note: k8s.SummaryOf(v.res, v.subject),
 		}})
+		for _, sec := range k8s.Details(v.subject) {
+			var fields []descRow
+			for _, f := range sec.Fields {
+				if v.matches(f.Key + " " + f.Value) {
+					fields = append(fields, descRow{kind: descField, f: f})
+				}
+			}
+			if len(fields) > 0 {
+				v.rows = append(v.rows, descRow{kind: descHeader, text: sec.Title})
+				v.rows = append(v.rows, fields...)
+			}
+		}
 		if !v.loaded {
 			v.rows = append(v.rows, descRow{kind: descInfo, text: "loading…"})
 		}
@@ -436,6 +465,13 @@ func (v *describeView) renderRow(r descRow, selected bool, w, kindW, reasonW, co
 			indent = "   "
 		}
 		return stMuted.Italic(true).Render(fit(indent+r.text, w))
+	case descField:
+		const keyW = 16
+		st := lipgloss.NewStyle()
+		if r.f.Warn {
+			st = stErr
+		}
+		return "   " + stMuted.Render(fit(r.f.Key, keyW)) + "  " + st.Render(fit(untab(r.f.Value), max(w-keyW-5, 1)))
 	}
 
 	var plain, styled strings.Builder
