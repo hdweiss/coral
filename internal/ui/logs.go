@@ -47,15 +47,17 @@ type logLinesMsg struct {
 // logView shows a container log in place of the table. Each line shows the
 // time, level, pinned fields and message; the detail panel shows the selected
 // entry as a tree. A pod with several containers shows them all, merged by
-// time and each line labelled with its container, until c picks one.
+// time and each line labelled with its container, until c picks one. A
+// workload (L on a deployment, say) shows all of its pods, labelled by pod.
 type logView struct {
 	rect    rect
 	focused bool
 
-	ctx        string // kube context
-	pod        *unstructured.Unstructured
-	containers []string
-	container  string // "" = all containers that have a log
+	ctx        string                       // kube context
+	subject    *unstructured.Unstructured   // the pod, or the workload
+	pods       []*unstructured.Unstructured // the subject, or the workload's pods
+	containers []string                     // of all pods, in Containers order
+	container  string                       // "" = all containers that have a log
 	previous   bool
 	labelW     int // width of the source labels; 0 when there is one source
 
@@ -78,11 +80,23 @@ type logView struct {
 }
 
 func newLogView(ctx string, pod *unstructured.Unstructured, fields *config.Fields) *logView {
-	v := &logView{ctx: ctx, pod: pod, containers: k8s.Containers(pod), fields: fields, follow: true}
+	return newWorkloadLogView(ctx, pod, []*unstructured.Unstructured{pod}, fields)
+}
+
+// newWorkloadLogView shows the logs of pods, the pods of subject.
+func newWorkloadLogView(ctx string, subject *unstructured.Unstructured, pods []*unstructured.Unstructured, fields *config.Fields) *logView {
+	v := &logView{ctx: ctx, subject: subject, pods: pods, fields: fields, follow: true}
+	for _, p := range pods {
+		for _, c := range k8s.Containers(p) {
+			if !slices.Contains(v.containers, c) {
+				v.containers = append(v.containers, c)
+			}
+		}
+	}
 	// One container, or the one the default-container annotation names;
 	// otherwise all of them, so that a sidecar listed first (Linkerd's and
 	// Istio's proxies are) doesn't hide the app's log.
-	if len(v.containers) == 1 || pod.GetAnnotations()["kubectl.kubernetes.io/default-container"] != "" {
+	if len(v.containers) == 1 || len(pods) == 1 && pods[0].GetAnnotations()["kubectl.kubernetes.io/default-container"] != "" {
 		v.container = v.containers[0]
 	}
 	return v
@@ -97,17 +111,29 @@ type logSource struct {
 // sources lists the logs the view streams: the selected container, or all
 // containers that have a log.
 func (v *logView) sources() []logSource {
-	names := []string{v.container}
-	if v.container == "" {
-		names = k8s.LogContainers(v.pod)
-	}
 	var out []logSource
-	for _, c := range names {
-		req := k8s.LogRequest{
-			Namespace: v.pod.GetNamespace(), Pod: v.pod.GetName(), Container: c,
-			Previous: v.previous, Follow: !v.previous, TailLines: logTail,
+	for _, pod := range v.pods {
+		names := k8s.LogContainers(pod)
+		if v.container != "" {
+			if !slices.Contains(k8s.Containers(pod), v.container) {
+				continue
+			}
+			names = []string{v.container}
 		}
-		out = append(out, logSource{req: req, label: c})
+		for _, c := range names {
+			req := k8s.LogRequest{
+				Namespace: pod.GetNamespace(), Pod: pod.GetName(), Container: c,
+				Previous: v.previous, Follow: !v.previous, TailLines: logTail,
+			}
+			label := c
+			if len(v.pods) > 1 {
+				label = pod.GetName()
+				if len(names) > 1 {
+					label += "/" + c
+				}
+			}
+			out = append(out, logSource{req: req, label: label})
+		}
 	}
 	if len(out) == 1 {
 		out[0].label = ""
@@ -439,7 +465,10 @@ func (v *logView) Update(msg tea.Msg) tea.Cmd {
 }
 
 func (v *logView) title() string {
-	t := "Logs " + v.pod.GetName()
+	t := "Logs " + v.subject.GetName()
+	if len(v.pods) > 1 || v.subject.GetKind() != "Pod" {
+		t = "Logs " + strings.ToLower(v.subject.GetKind()) + " " + v.subject.GetName() + fmt.Sprintf(" (%d pods)", len(v.pods))
+	}
 	if len(v.containers) > 1 {
 		c := v.container
 		if c == "" {

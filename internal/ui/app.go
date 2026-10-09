@@ -435,22 +435,74 @@ func (a *App) logPod() *unstructured.Unstructured {
 	return a.table.Selected()
 }
 
-// openLogs shows the log of the selected pod in place of the table.
+// openLogs shows the log of the selected pod in place of the table, or the
+// logs of the selected workload's pods.
 func (a *App) openLogs() tea.Cmd {
+	if obj, res, ok := a.selected(); ok && slices.Contains(k8s.LogWorkloads, res.ID()) {
+		return a.loadWorkloadPods(obj)
+	}
 	pod := a.logPod()
 	if pod == nil {
-		a.setFlash("logs: select a pod", true)
+		a.setFlash("logs: select a pod or workload", true)
 		return nil
 	}
+	return a.showLogs(newLogView(a.cur.Context, pod, a.detail.fields))
+}
+
+func (a *App) showLogs(v *logView) tea.Cmd {
 	if a.filtering {
 		a.stopFilter(false)
 	}
 	a.closeDesc()
-	a.logs = newLogView(a.cur.Context, pod, a.detail.fields)
+	a.logs = v
 	a.setFocus(focusTable)
 	cmd := a.logs.start(a.store.Provider())
 	a.syncDetail()
 	return cmd
+}
+
+// maxLogPods caps the pods whose logs a workload's log view streams.
+const maxLogPods = 30
+
+// workloadPodsMsg brings the pods of a workload whose logs to show.
+type workloadPodsMsg struct {
+	ctx      string
+	workload *unstructured.Unstructured
+	pods     []*unstructured.Unstructured
+	err      error
+}
+
+// loadWorkloadPods finds the pods of a workload, from the cached pod list of
+// its namespace when it is fresh, and then shows their logs.
+func (a *App) loadWorkloadPods(w *unstructured.Unstructured) tea.Cmd {
+	store, ctx := a.store, a.cur.Context
+	key := k8s.Key{Context: ctx, GVR: k8s.MustLookup("pods").GVR(), Namespace: w.GetNamespace()}
+	a.setFlash("finding the pods of "+w.GetName()+"…", false)
+	return func() tea.Msg {
+		e := store.Cached(key, freshFor)
+		if e.Err != nil {
+			return workloadPodsMsg{err: e.Err}
+		}
+		pods, err := k8s.PodsOf(w, e.Items)
+		return workloadPodsMsg{ctx: ctx, workload: w, pods: pods, err: err}
+	}
+}
+
+func (a *App) onWorkloadPods(msg workloadPodsMsg) tea.Cmd {
+	switch {
+	case msg.err != nil:
+		a.setFlash("logs: "+msg.err.Error(), true)
+		return nil
+	case len(msg.pods) == 0:
+		a.setFlash(msg.workload.GetName()+" has no pods", true)
+		return nil
+	case len(msg.pods) > maxLogPods:
+		a.setFlash(fmt.Sprintf("showing the logs of %d of %d pods", maxLogPods, len(msg.pods)), false)
+		msg.pods = msg.pods[:maxLogPods]
+	default:
+		a.flash = ""
+	}
+	return a.showLogs(newWorkloadLogView(msg.ctx, msg.workload, msg.pods, a.detail.fields))
 }
 
 // openDescribe shows the events (E) or the description (d) of the selected
@@ -471,7 +523,7 @@ func (a *App) openDescribe(eventsOnly bool) tea.Cmd {
 			subject = a.desc.subject
 		}
 	case a.logs != nil:
-		subject = a.logs.pod
+		subject = a.logs.subject
 	default:
 		subject = a.table.Selected()
 	}
@@ -694,6 +746,8 @@ func (a *App) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		cmd = a.onEditReady(msg)
 	case deletedMsg:
 		cmd = a.onDeleted(msg)
+	case workloadPodsMsg:
+		cmd = a.onWorkloadPods(msg)
 	case execDoneMsg:
 		cmd = a.onExecDone(msg)
 	case editorExitMsg:
@@ -1599,7 +1653,7 @@ func (a *App) renderHeader() string {
 		seg(stBar.Foreground(colAccent).Bold(true).Render(a.desc.label()), func() tea.Cmd { return a.popDesc() })
 	} else if a.logs != nil {
 		seg(sep, nil)
-		seg(stBar.Render(a.logs.pod.GetName()), nil)
+		seg(stBar.Render(a.logs.subject.GetName()), nil)
 		seg(sep, nil)
 		seg(stBar.Foreground(colAccent).Bold(true).Render("Logs"), func() tea.Cmd { a.closeLogs(); return nil })
 	} else if o := a.table.Selected(); o != nil {

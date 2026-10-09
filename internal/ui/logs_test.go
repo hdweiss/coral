@@ -7,6 +7,7 @@ import (
 	"strings"
 	"testing"
 
+	tea "charm.land/bubbletea/v2"
 	"github.com/hdweiss/coral/internal/config"
 	"github.com/hdweiss/coral/internal/k8s"
 	"github.com/hdweiss/coral/internal/logs"
@@ -175,5 +176,34 @@ func TestLogViewMergeKeepsSelection(t *testing.T) {
 	}
 	if e := v.Selected(); e == nil || e.Raw != "line 3" {
 		t.Errorf("selection moved to %+v", e)
+	}
+}
+
+func TestWorkloadLogs(t *testing.T) {
+	a := newTestApp(t, Options{})
+	a.Init()
+	deploy := k8s.MustLookup("deployments")
+	key := k8s.Key{Context: "demo-dev", GVR: deploy.GVR(), Namespace: "shop"}
+	a.activate(key, deploy)
+	a.Update(fetchedMsg{key: key, entry: a.store.Fetch(key)})
+	for a.table.Selected().GetName() != "frontend" {
+		a.table.Update(tea.KeyPressMsg{Code: tea.KeyDown})
+	}
+	_, cmd := a.Update(tea.KeyPressMsg{Code: 'L', Text: "L"})
+	msg, ok := cmd().(workloadPodsMsg)
+	if !ok || msg.err != nil {
+		t.Fatalf("got %#v", msg)
+	}
+	a.Update(msg)
+	if a.logs == nil || len(a.logs.pods) != 3 {
+		t.Fatalf("log view of %d pods", len(a.logs.pods))
+	}
+	defer a.logs.stop()
+	srcs := a.logs.sources()
+	if len(srcs) != 3 || !strings.HasPrefix(srcs[0].label, "frontend-") || strings.Contains(srcs[0].label, "/") {
+		t.Errorf("sources %+v", srcs)
+	}
+	if !strings.Contains(a.logs.title(), "deployment frontend (3 pods)") {
+		t.Errorf("title %q", a.logs.title())
 	}
 }

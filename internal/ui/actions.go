@@ -33,7 +33,7 @@ func kinds(ids ...string) func(k8s.Resource) bool {
 // methods that read it.
 func objectActions() []action {
 	return []action{
-		{key: "L", label: "logs", desc: "show the pod's log", on: kinds("pods"),
+		{key: "L", label: "logs", desc: "show the log (of every pod of a workload)", on: kinds(append([]string{"pods"}, k8s.LogWorkloads...)...),
 			run: func(a *App, _ *unstructured.Unstructured) tea.Cmd { return a.openLogs() }},
 		{key: "p", label: "previous logs", desc: "show the previous container's log", on: kinds("pods"),
 			run: func(a *App, _ *unstructured.Unstructured) tea.Cmd { return a.previousLogs() }},

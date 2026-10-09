@@ -1,8 +1,12 @@
 package k8s
 
 import (
+	"slices"
+	"strings"
+
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
+	"k8s.io/apimachinery/pkg/labels"
 )
 
 // LogRequest selects a container log.
@@ -100,4 +104,23 @@ func ContainerRunning(pod *unstructured.Unstructured, name string) bool {
 		}
 	}
 	return false
+}
+
+// LogWorkloads are the resources whose pods L shows together.
+var LogWorkloads = []string{"deployments", "statefulsets", "daemonsets", "replicasets", "jobs"}
+
+// PodsOf picks the pods a workload selects from pods, sorted by name.
+func PodsOf(workload *unstructured.Unstructured, pods []unstructured.Unstructured) ([]*unstructured.Unstructured, error) {
+	sel, err := labelSelector(workload, "spec", "selector")
+	if err != nil {
+		return nil, err
+	}
+	var out []*unstructured.Unstructured
+	for i := range pods {
+		if pods[i].GetNamespace() == workload.GetNamespace() && sel.Matches(labels.Set(pods[i].GetLabels())) {
+			out = append(out, &pods[i])
+		}
+	}
+	slices.SortFunc(out, func(a, b *unstructured.Unstructured) int { return strings.Compare(a.GetName(), b.GetName()) })
+	return out, nil
 }
