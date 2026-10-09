@@ -27,6 +27,9 @@ type Entry struct {
 	Items     []unstructured.Unstructured
 	FetchedAt time.Time
 	Err       error
+	// ResourceVersion is the list's, or that of the last change a watch
+	// applied; a watch resumes from it. "" for lists read from disk.
+	ResourceVersion string
 }
 
 // Store caches list results so that views render instantly from memory and
@@ -107,14 +110,14 @@ func (s *Store) Fetch(k Key) Entry {
 	s.mu.Unlock()
 
 	e := Entry{FetchedAt: time.Now()}
-	items, err := s.list(k)
+	items, rv, err := s.list(k)
 	if err != nil {
 		e.Err = err
 		if old, ok := s.Get(k); ok {
-			e.Items = old.Items
+			e.Items, e.ResourceVersion = old.Items, old.ResourceVersion
 		}
 	} else {
-		e.Items = items
+		e.Items, e.ResourceVersion = items, rv
 	}
 	s.mu.Lock()
 	s.entries[k] = e
@@ -141,10 +144,10 @@ func (s *Store) Cached(k Key, maxAge time.Duration) Entry {
 	return s.Fetch(k)
 }
 
-func (s *Store) list(k Key) ([]unstructured.Unstructured, error) {
+func (s *Store) list(k Key) ([]unstructured.Unstructured, string, error) {
 	client, err := s.provider.Client(k.Context)
 	if err != nil {
-		return nil, err
+		return nil, "", err
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), s.timeout)
 	defer cancel()
@@ -157,9 +160,9 @@ func (s *Store) list(k Key) ([]unstructured.Unstructured, error) {
 	// which a refreshing view doesn't mind.
 	list, err := ri.List(ctx, metav1.ListOptions{ResourceVersion: "0", FieldSelector: k.Fields})
 	if err != nil {
-		return nil, err
+		return nil, "", err
 	}
-	return list.Items, nil
+	return list.Items, list.GetResourceVersion(), nil
 }
 
 func (s *Store) resource(k Key, namespace string) (dynamic.ResourceInterface, error) {

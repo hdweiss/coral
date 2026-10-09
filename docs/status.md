@@ -14,6 +14,7 @@ internal/k8s/             data layer
   printer.go              columns from additionalPrinterColumns (JSONPath), CRDs list columns
   columns.go              per-kind table columns (pods, deploy, svc, …) + generic fallback
   store.go                cache of list results keyed by (context, GVR, namespace, field selector); in-flight dedupe; Registry per context
+  watch.go                Store.Watch: list, then watch from its resourceVersion into the cached entry (live mode, R)
   diskcache.go            CRD lists on disk (os.UserCacheDir()/coral/<context>/crds.json)
   trace.go                --trace-api: request log via WrapTransport (real) or a reactor (demo)
   provider.go             kubeconfig → dynamic client per context; OpenAPI through client-go's disk HTTP cache
@@ -22,6 +23,7 @@ internal/k8s/             data layer
   related.go              related objects for describe: owners, selected pods, services, policies, uses / used by
   related_crds.go         relations of cert-manager, Cilium, Linkerd and Gateway API objects, both ways
   demo.go                 fake dynamic client with two realistic clusters (--demo)
+  demo_churn.go           k8s.Churn: the demo clusters change every 3s (crash loop restarts, a frontend pod replaced)
   demo_crds.go            demo CRDs and instances: cert-manager, Prometheus operator (dev only), Gateway API, Cilium, Linkerd
   demo_logs.go            generated demo logs: ECS JSON, zap JSON, nginx/redis/logfmt text, klog
 internal/config/          persisted user state: pins.json, fields.json
@@ -47,7 +49,7 @@ internal/ui/              TUI
 
 Run it with `make demo` (`make build`, `make test`, `make check` and `make install` also exist). There is no real cluster in the dev environment, so test with `--demo`. tmux is installed; `tmux new -d -s coral -x 160 -y 40 ./bin/coral --demo` plus `tmux capture-pane -p` works for checking the screen.
 
-Tests: `go test ./...` (demo store lists every builtin and custom resource; events and warning counts; relations on the demo cluster; store dedupe, update and disk cache; CRD parsing, printer columns, registry lookup; navigator Custom Resources folders and pins; refresh pausing; yamltree ordering and folding; table column layout).
+Tests: `go test ./...` (demo store lists every builtin and custom resource; events and warning counts; relations on the demo cluster; store dedupe, update and disk cache; watches and demo churn; CRD parsing, printer columns, registry lookup; navigator Custom Resources folders and pins; refresh pausing; live-mode watch lifecycle; yamltree ordering and folding; table column layout).
 
 `--trace-api <file>` logs every request (in demo mode: verb, resource, namespace, field selector). Use it to check what a change costs in requests.
 
@@ -59,10 +61,11 @@ Mouse can be scripted in tmux by sending SGR sequences as literal keys, for exam
 
 ## Design decisions
 
-- **Keys follow k9s** where coral has the same feature and it doesn't clash with `h`/`l` panel movement: `0` all namespaces, `1`–`9` open pins (numbered in the navigator, in pin order), `y` YAML details, `p` previous logs, `s`/`f` autoscroll/fullscreen in the log view, `ctrl+r` refresh (`r` too). Coral-only actions moved to ctrl keys to keep k9s's letters free: `ctrl+p` pin/favorite, `ctrl+n` add field, `ctrl+x` hide field. Deliberate differences: `L` logs (k9s `l`, which is "right" here), `s`/`S` sort in the table (k9s sorts with shift+column letter; `s` will need to move when shell lands), and `ctrl+d`/`ctrl+u` no longer page so `ctrl+d` is free for delete. `d` is describe and `E` events (k9s has no `E`; its events are a resource view). `a`, `x` (outside the details), `space` in the table and `ctrl+k` are kept free for attach, Secret decode, marking and kill.
+- **Keys follow k9s** where coral has the same feature and it doesn't clash with `h`/`l` panel movement: `0` all namespaces, `1`–`9` open pins (numbered in the navigator, in pin order), `y` YAML details, `p` previous logs, `s`/`f` autoscroll/fullscreen in the log view, `ctrl+r` refresh (`r` too). `R` switches live mode (k9s has no `R`; plan.md had it reserved for a refresh dialog). Coral-only actions moved to ctrl keys to keep k9s's letters free: `ctrl+p` pin/favorite, `ctrl+n` add field, `ctrl+x` hide field. Deliberate differences: `L` logs (k9s `l`, which is "right" here), `s`/`S` sort in the table (k9s sorts with shift+column letter; `s` will need to move when shell lands), and `ctrl+d`/`ctrl+u` no longer page so `ctrl+d` is free for delete. `d` is describe and `E` events (k9s has no `E`; its events are a resource view). `a`, `x` (outside the details), `space` in the table and `ctrl+k` are kept free for attach, Secret decode, marking and kill.
 
 - **Cache first:** views render from the Store immediately. They refetch if the data is older than 5s, and the visible list refreshes in the background every `--refresh`. `r` refreshes now.
-- **Network traffic** ([network.md](network.md), items 1–5 and 7–12 done, 6 (watches) open):
+- **Live mode (`R`, off by default):** the visible list and its warning events are watched instead of polled (`Store.Watch`, network.md item 6). `App.syncWatches` runs at the end of every `Update` and starts/stops watches to match: none while logs or describe cover the table, but they keep running while the terminal is unfocused (an idle watch is nearly free, and a live list is often watched from another window). The header shows "● live" instead of "updated … ago"; a click on either switches the mode. A watch always lists first (deduped with the table's fetch), then watches from that list's resourceVersion with bookmarks and a 5–10 minute server timeout, resuming from the last version seen; 410 Gone or a failed watch relists, with 1s–30s backoff. Changes are applied in batches to a copy of the cached items (views hold the old slice); a batch whose entry was relisted meanwhile (`r`) is dropped and the watch resumes from the new list. Watches signal the UI through one coalescing channel (`watchedMsg`), so a burst renders once. Describe still polls its events on the tick. The demo changes on its own (`k8s.Churn`, started by main in demo mode, not in tests) so there is something to see; it writes to the fake trackers, so it doesn't show in `--trace-api`.
+- **Network traffic** ([network.md](network.md), items 1–12 done; 6 as the opt-in live mode):
   - Moving the navigator cursor only highlights; `enter`, `l`/right or a click opens the list.
   - The tick refreshes nothing while the terminal is unfocused (`View.ReportFocus`, `tea.FocusMsg`/`BlurMsg`), nor a list covered by logs or describe; `App.refreshDue` catches up on the next tick or on focus.
   - Lists use `ResourceVersion: "0"` (watch cache). Since that can lag a write, `Store.Update` puts the updated object into every cached list of its resource, and an edit no longer relists.

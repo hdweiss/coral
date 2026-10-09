@@ -60,6 +60,7 @@ func NewDemoProvider(trace *Tracer) Provider {
 		c.PrependReactor("update", "*", versionUpdates(c.Tracker()))
 		if trace != nil {
 			c.PrependReactor("*", "*", trace.reactor(name))
+			c.PrependWatchReactor("*", trace.watchReactor(name))
 		}
 		p.clients[name] = c
 	}

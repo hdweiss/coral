@@ -1,11 +1,13 @@
 package ui
 
 import (
+	"context"
 	"testing"
 	"time"
 
 	tea "charm.land/bubbletea/v2"
 	"github.com/hdweiss/coral/internal/k8s"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 )
 
 func newTestApp(t *testing.T, opts Options) *App {
@@ -67,5 +69,57 @@ func TestDescribeShowsSubjectFirst(t *testing.T) {
 	a.openDescribe(false)
 	if a.desc != nil {
 		t.Error("d on the top row opened another view")
+	}
+}
+
+func TestLiveWatchesVisibleList(t *testing.T) {
+	a := newTestApp(t, Options{Refresh: time.Nanosecond})
+	a.Init()
+	a.store.Fetch(a.cur)
+	a.Update(tea.KeyPressMsg{Code: 'R', Text: "R"})
+	ek, _ := a.warningsKey()
+	if len(a.watches) != 2 || a.watches[a.cur] == nil || a.watches[ek] == nil {
+		t.Fatalf("watches %v, want the list and its warnings", a.watches)
+	}
+	clear(a.loading)
+	if a.refreshDue() != nil {
+		t.Error("polling a watched list")
+	}
+
+	// A change to the cluster reaches the table without a fetch.
+	e, _ := a.store.Get(a.cur)
+	victim := e.Items[0].GetName()
+	ri, _ := a.store.Provider().Client(a.cur.Context)
+	if err := ri.Resource(a.cur.GVR).Namespace(a.cur.Namespace).Delete(context.Background(), victim, metav1.DeleteOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	deadline := time.After(2 * time.Second)
+	for {
+		msg := make(chan tea.Msg)
+		go func() { msg <- a.waitWatched()() }()
+		select {
+		case m := <-msg:
+			a.Update(m)
+		case <-deadline:
+			t.Fatal("the deletion never reached the table")
+		}
+		if len(a.table.rows) == len(e.Items)-1 {
+			break
+		}
+	}
+
+	a.logs = &logView{}
+	a.syncWatches()
+	if len(a.watches) != 0 {
+		t.Error("watching a list hidden by the log view")
+	}
+	a.logs = nil
+	a.Update(tea.BlurMsg{})
+	if len(a.watches) != 2 {
+		t.Error("an unfocused terminal stopped the watches")
+	}
+	a.Update(tea.KeyPressMsg{Code: 'R', Text: "R"})
+	if len(a.watches) != 0 {
+		t.Error("watches left running after live mode was switched off")
 	}
 }

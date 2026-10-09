@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/watch"
 	k8stesting "k8s.io/client-go/testing"
 )
 
@@ -52,6 +53,10 @@ func (rt traceRT) RoundTrip(req *http.Request) (*http.Response, error) {
 	if err != nil {
 		rt.t.logf("%s %s error %v %s", req.Method, req.URL.RequestURI(), err, time.Since(start).Round(time.Millisecond))
 		return resp, err
+	}
+	if req.URL.Query().Get("watch") == "true" {
+		// Its line is written when it ends, minutes later.
+		rt.t.logf("%s %s %d watch opened", req.Method, req.URL.RequestURI(), resp.StatusCode)
 	}
 	resp.Body = &traceBody{ReadCloser: resp.Body, done: func(n int64) {
 		enc := ""
@@ -100,20 +105,38 @@ func formatBytes(n int64) string {
 // selectors. It never handles the action itself.
 func (t *Tracer) reactor(cluster string) k8stesting.ReactionFunc {
 	return func(action k8stesting.Action) (bool, runtime.Object, error) {
-		var b strings.Builder
-		fmt.Fprintf(&b, "%s %s %s", cluster, strings.ToUpper(action.GetVerb()), action.GetResource().Resource)
-		if g := action.GetResource().Group; g != "" {
-			b.WriteString("." + g)
-		}
-		if ns := action.GetNamespace(); ns != "" {
-			b.WriteString(" ns=" + ns)
-		}
-		if l, ok := action.(k8stesting.ListAction); ok {
-			if f := l.GetListRestrictions().Fields; f != nil && !f.Empty() {
-				b.WriteString(" fields=" + f.String())
-			}
-		}
-		t.logf("%s", b.String())
+		t.logAction(cluster, action)
 		return false, nil, nil
 	}
+}
+
+// watchReactor logs the watches of a demo cluster, like reactor.
+func (t *Tracer) watchReactor(cluster string) k8stesting.WatchReactionFunc {
+	return func(action k8stesting.Action) (bool, watch.Interface, error) {
+		t.logAction(cluster, action)
+		return false, nil, nil
+	}
+}
+
+func (t *Tracer) logAction(cluster string, action k8stesting.Action) {
+	var b strings.Builder
+	fmt.Fprintf(&b, "%s %s %s", cluster, strings.ToUpper(action.GetVerb()), action.GetResource().Resource)
+	if g := action.GetResource().Group; g != "" {
+		b.WriteString("." + g)
+	}
+	if ns := action.GetNamespace(); ns != "" {
+		b.WriteString(" ns=" + ns)
+	}
+	if l, ok := action.(k8stesting.ListAction); ok {
+		if f := l.GetListRestrictions().Fields; f != nil && !f.Empty() {
+			b.WriteString(" fields=" + f.String())
+		}
+	}
+	if w, ok := action.(k8stesting.WatchAction); ok {
+		if f := w.GetWatchRestrictions().Fields; f != nil && !f.Empty() {
+			b.WriteString(" fields=" + f.String())
+		}
+		b.WriteString(" rv=" + w.GetWatchRestrictions().ResourceVersion)
+	}
+	t.logf("%s", b.String())
 }

@@ -2,6 +2,7 @@
 package main
 
 import (
+	"context"
 	"flag"
 	"fmt"
 	"io"
@@ -63,6 +64,7 @@ func rootCmd() *cobra.Command {
 			}
 			if demo {
 				p = k8s.NewDemoProvider(trace)
+				go k8s.Churn(context.Background(), p, 3*time.Second)
 			} else if p, err = k8s.NewKubeProvider(k8s.KubeOptions{Kubeconfig: kubeconfig, Trace: trace, CacheDir: cacheDir}); err != nil {
 				return err
 			}

@@ -1,6 +1,6 @@
 # Network traffic
 
-**Status (2026-10-04):** items 1–5 and 7–12 are done (see status.md); 6 (watches) is open, to decide on with `--trace-api` numbers from a real cluster. Item 2 settled on: cursor movement never opens a list, cached or not. Item 10 filters by `involvedObject.kind` and `.name` rather than uid, which also covers events without one; `k8s.EventsAbout` drops earlier objects of the same name. Item 11's CRD list keeps the same 10-minute age on disk as in memory.
+**Status (2026-10-09):** items 1–12 are done (see status.md). 6 is opt-in as live mode (`R`): the visible list and its warnings are watched instead of polled. Whether to make it the default is still to decide with `--trace-api` numbers from a real cluster. Item 2 settled on: cursor movement never opens a list, cached or not. Item 10 filters by `involvedObject.kind` and `.name` rather than uid, which also covers events without one; `k8s.EventsAbout` drops earlier objects of the same name. Item 11's CRD list keeps the same 10-minute age on disk as in memory.
 
 Plan for cutting unnecessary API requests, written 2026-10-04 from a review of every call path. Items are in the agreed order: 1–5 first (small, cover most of the waste), then decide on 6. Each needs a demo side, like everything in [plan.md](plan.md).
 

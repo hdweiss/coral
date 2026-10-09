@@ -27,7 +27,7 @@ What people reach for k9s for most of the time.
   - `a` is free (add field moved to `ctrl+n`). `s` is still table sort, so shell needs `s` freed (sort to shift+letter like k9s) or another key.
 - **Delete and kill (`ctrl+d` / `ctrl+k`).** Confirm dialog with the object name; options for cascade (background/foreground/orphan) and grace period. Kill is delete with grace period 0. The table keeps its cursor on the next row. Demo: the fake tracker already supports delete; also re-create pods owned by a ReplicaSet so it feels real.
 - **Events.** Done (see status.md): an `events` resource directly under each namespace in the navigator (LAST SEEN, TYPE, REASON, OBJECT, COUNT, MESSAGE, newest first, warnings in red); `E` lists the selected object's events in place of the table; a red `⚠N` after the name marks rows with Warning events in the last hour (click it for the events). Still open:
-  - Watch events instead of polling them with the list refresh.
+  - Watch events instead of polling them with the list refresh. Done for the ⚠ markers in live mode (`R`); the describe view still polls.
   - Use a server-side field selector (`involvedObject.uid`) for `E` on large namespaces; today the namespace's events are listed and filtered client-side (the demo's fake client ignores field selectors).
   - Events of owned objects in `E`/`d` (a deployment's ReplicaSets and pods), like a timeline of a rollout.
   - A ⚠ count per namespace in the navigator.
@@ -37,8 +37,9 @@ What people reach for k9s for most of the time.
 
 ## Network traffic
 
-Done (see status.md) except watches: lists open on enter rather than cursor movement, refresh pauses when hidden, cheaper ⚠ markers, watch-cache lists, in-flight dedupe, server-side event filters, a disk cache for CRDs and OpenAPI, and `--trace-api`. The itemized plan is in [network.md](network.md). Still open:
-  - Item 6, watching the visible list instead of relisting it.
+Done (see status.md): lists open on enter rather than cursor movement, refresh pauses when hidden, cheaper ⚠ markers, watch-cache lists, in-flight dedupe, server-side event filters, a disk cache for CRDs and OpenAPI, `--trace-api`, and watches as live mode (`R`). The itemized plan is in [network.md](network.md). Still open:
+  - Live mode by default (or a `--live` flag), once `--trace-api` on a real cluster shows how watches behave there.
+  - Watches for the describe view's events.
 
 ## Phase 2: reach
 
@@ -77,7 +78,6 @@ From the brainstorm and earlier sessions; these are what set coral apart from k9
 - **Add-field improvements.** Insert directly without the editor when a value was typed (needs a confirm/diff step). Required-field scaffolding for new list items (a container needs name and image). Enum value suggestions after `:`.
 - **Field favorites.** A "favorites summary" pinned at the very top of the view; a per-cluster scope; a UI listing all favorite/hidden rules of a kind.
 - **Pins.** Reordering (`K`/`J`, or drag). Pinning the current resource list from the header ☆ and `:pin` (today only the namespace or cluster).
-- **`R` refresh dialog.** Meaning still to define (refresh interval, timeout, which lists).
 - **Light themes.** Auto-detect the terminal background (`tea.BackgroundColorMsg`) for the built-in palette.
 - **Links.** Open a pod's log URL from an annotation, open ingresses and services in the browser (reuse `openURL`).
 - **Subcommands.** Non-TUI subcommands (the brainstorm mentions them), e.g. `coral get` with the same columns.

@@ -45,6 +45,8 @@ type (
 		entry k8s.Entry
 	}
 	tickMsg time.Time
+	// watchedMsg says that a watched list changed.
+	watchedMsg struct{}
 	// openInstancesMsg opens the instances of the CRD selected in the CRDs
 	// list.
 	openInstancesMsg struct{}
@@ -82,6 +84,13 @@ type App struct {
 
 	loading map[k8s.Key]bool
 	blurred bool // the terminal lost focus; refreshes pause
+
+	// live (R) watches the visible list and its warnings instead of
+	// refreshing them on the tick. watches holds the running watches;
+	// watched is signalled when one changed its list.
+	live    bool
+	watches map[k8s.Key]func()
+	watched chan struct{}
 
 	navW, detailW int
 	drag          int // 0 none, 1 nav|table divider, 2 table|detail divider
@@ -150,6 +159,8 @@ func New(store *k8s.Store, opts Options) (*App, error) {
 		ctx:           ctx,
 		ns:            ns,
 		loading:       map[k8s.Key]bool{},
+		watches:       map[k8s.Key]func(){},
+		watched:       make(chan struct{}, 1),
 		navW:          30,
 		filterInput:   fi,
 		schemas:       map[string]schema.Source{},
@@ -181,6 +192,7 @@ func (a *App) Init() tea.Cmd {
 		a.fetchCRDs(a.ctx),
 		a.activate(k8s.Key{Context: a.ctx, GVR: pods.GVR(), Namespace: a.ns}, pods),
 		tick(),
+		a.waitWatched(),
 	}
 	// Pins of custom resources show once their context's CRDs are known.
 	for _, pin := range a.nav.pins {
@@ -193,6 +205,60 @@ func (a *App) Init() tea.Cmd {
 
 func tick() tea.Cmd {
 	return tea.Tick(time.Second, func(t time.Time) tea.Msg { return tickMsg(t) })
+}
+
+// waitWatched waits for a watch to change its list. Signals coalesce, so
+// a burst of changes renders once.
+func (a *App) waitWatched() tea.Cmd {
+	ch := a.watched
+	return func() tea.Msg {
+		<-ch
+		return watchedMsg{}
+	}
+}
+
+func (a *App) notifyWatched() {
+	select {
+	case a.watched <- struct{}{}:
+	default:
+	}
+}
+
+// syncWatches runs the watches that live mode wants: the visible list and
+// its warnings, unless a log or describe view hides them. They keep running
+// while the terminal is unfocused, unlike the tick refresh: an idle watch
+// costs next to nothing, and a live list is often watched from another
+// window.
+func (a *App) syncWatches() {
+	want := map[k8s.Key]bool{}
+	if a.live && !a.subview() && a.cur.GVR.Resource != "" {
+		want[a.cur] = true
+		if ek, ok := a.warningsKey(); ok {
+			want[ek] = true
+		}
+	}
+	for k, stop := range a.watches {
+		if !want[k] {
+			stop()
+			delete(a.watches, k)
+		}
+	}
+	for k := range want {
+		if a.watches[k] == nil {
+			a.watches[k] = a.store.Watch(k, a.notifyWatched)
+		}
+	}
+}
+
+// toggleLive switches live mode (R) on or off.
+func (a *App) toggleLive() {
+	a.live = !a.live
+	if a.live {
+		a.setFlash("live: watching for changes", false)
+	} else {
+		a.setFlash("live off: refreshing every "+a.opts.Refresh.String(), false)
+	}
+	a.syncWatches()
 }
 
 // fetch lists key in the background unless a fetch is already running.
@@ -296,6 +362,9 @@ func (a *App) refreshDue() tea.Cmd {
 		return nil
 	}
 	stale := func(k k8s.Key) bool {
+		if a.watches[k] != nil {
+			return false
+		}
 		e, ok := a.store.Get(k)
 		return ok && time.Since(e.FetchedAt) >= a.opts.Refresh
 	}
@@ -584,27 +653,13 @@ func (a *App) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		a.layout()
 	case fetchedMsg:
 		delete(a.loading, msg.key)
-		if msg.key.GVR == nsGVR && msg.key.Namespace == "" {
-			names := make([]string, 0, len(msg.entry.Items))
-			for _, it := range msg.entry.Items {
-				names = append(names, it.GetName())
+		a.onEntry(msg.key, msg.entry)
+	case watchedMsg:
+		cmd = a.waitWatched()
+		for k := range a.watches {
+			if e, ok := a.store.Get(k); ok {
+				a.onEntry(k, e)
 			}
-			slices.Sort(names)
-			a.nav.SetNamespaces(msg.key.Context, names, msg.entry.Err)
-		}
-		if msg.key == a.cur {
-			a.table.loading = false
-			a.table.SetEntry(msg.entry)
-			a.syncDetail()
-			if msg.entry.Err != nil {
-				a.setFlash(msg.entry.Err.Error(), true)
-			}
-		}
-		if msg.key == k8s.CRDKey(msg.key.Context) {
-			a.nav.SetCustom(msg.key.Context)
-		}
-		if k, ok := a.warningsKey(); ok && msg.key == k {
-			a.setWarnings(msg.entry)
 		}
 	case describeMsg:
 		msg.view.onLoaded(msg)
@@ -684,7 +739,35 @@ func (a *App) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	if a.detail.info.on {
 		cmd = tea.Batch(cmd, a.ensureDetailSchema())
 	}
+	// Whatever changed the view may have changed what to watch.
+	a.syncWatches()
 	return a, cmd
+}
+
+// onEntry shows a list that was fetched or changed by a watch.
+func (a *App) onEntry(key k8s.Key, e k8s.Entry) {
+	if key.GVR == nsGVR && key.Namespace == "" {
+		names := make([]string, 0, len(e.Items))
+		for _, it := range e.Items {
+			names = append(names, it.GetName())
+		}
+		slices.Sort(names)
+		a.nav.SetNamespaces(key.Context, names, e.Err)
+	}
+	if key == a.cur {
+		a.table.loading = a.loading[key]
+		a.table.SetEntry(e)
+		a.syncDetail()
+		if e.Err != nil {
+			a.setFlash(e.Err.Error(), true)
+		}
+	}
+	if key == k8s.CRDKey(key.Context) {
+		a.nav.SetCustom(key.Context)
+	}
+	if k, ok := a.warningsKey(); ok && key == k {
+		a.setWarnings(e)
+	}
 }
 
 // detailSchemaKey identifies the schema the detail view needs.
@@ -824,6 +907,9 @@ func (a *App) handleKey(msg tea.KeyPressMsg) tea.Cmd {
 		if a.logs == nil && (a.focus == focusTable || a.focus == focusDetail) {
 			return a.startAdd()
 		}
+	case "R":
+		a.toggleLive()
+		return nil
 	case "r", "ctrl+r":
 		if a.logs != nil {
 			return a.logs.start(a.store.Provider())
@@ -1476,13 +1562,19 @@ func (a *App) renderHeader() string {
 	switch {
 	case a.subview():
 	case a.table.loading:
-		right = "⟳ loading "
+		right = stBarText.Render("⟳ loading ")
+	case a.watches[a.cur] != nil:
+		right = stBar.Foreground(colAccent).Bold(true).Render("● live ")
 	default:
 		if e, ok := a.store.Get(a.cur); ok {
-			right = "updated " + duration.HumanDuration(time.Since(e.FetchedAt)) + " ago "
+			right = stBarText.Render("updated " + duration.HumanDuration(time.Since(e.FetchedAt)) + " ago ")
 		}
 	}
-	right = stBarText.Render(right)
+	if right != "" {
+		// A click switches live mode.
+		x := a.w - ansi.StringWidth(right) - len(" ? help ")
+		a.buttons = append(a.buttons, button{x0: x, x1: x + ansi.StringWidth(right), y: 0, run: func() tea.Cmd { a.toggleLive(); return nil }})
+	}
 	help := stBarKey.Render(" ? ") + stBarText.Render("help ")
 	pad := a.w - x - ansi.StringWidth(right) - ansi.StringWidth(help)
 	if pad > 0 {
@@ -1617,6 +1709,7 @@ func helpView(w, h int) string {
 			{"ctrl+p", "pin / unpin: navigator node, or here (namespace or cluster) from the table"},
 			{"z", "zoom the focused panel"},
 			{"r ctrl+r", "refresh"},
+			{"R", "live: watch the visible list for changes instead of refreshing it"},
 			{"esc", "back / clear filter / unzoom"},
 			{"q", "quit"},
 		}},
