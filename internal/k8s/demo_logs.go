@@ -48,8 +48,13 @@ func (p *demoProvider) Logs(ctx context.Context, kctx string, req LogRequest) (i
 			// Quiet, like a real proxy once it is up.
 			n, every, wait = 40, time.Minute, 6000
 		}
-		if req.TailLines > 0 {
+		switch {
+		case req.SinceSeconds > 0:
+			n = min(int(time.Duration(req.SinceSeconds)*time.Second/every), 5000)
+		case req.TailLines > 0:
 			n = min(n, int(req.TailLines))
+		default: // everything: a longer history
+			n = min(5*n, 5000)
 		}
 		now := time.Now()
 		write := func(t time.Time, line string) bool {

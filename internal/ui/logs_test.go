@@ -3,11 +3,14 @@ package ui
 import (
 	"context"
 	"fmt"
+	"os"
 	"slices"
 	"strings"
 	"testing"
+	"time"
 
 	tea "charm.land/bubbletea/v2"
+	"charm.land/lipgloss/v2"
 	"github.com/hdweiss/coral/internal/config"
 	"github.com/hdweiss/coral/internal/k8s"
 	"github.com/hdweiss/coral/internal/logs"
@@ -205,5 +208,84 @@ func TestWorkloadLogs(t *testing.T) {
 	}
 	if !strings.Contains(a.logs.title(), "deployment frontend (3 pods)") {
 		t.Errorf("title %q", a.logs.title())
+	}
+}
+
+func TestLayoutSegments(t *testing.T) {
+	plain := lipgloss.NewStyle()
+	segs := []segment{{"abcdef", plain}, {"ghij", plain}, {"\n", plain}, {"kl", plain}}
+	got := layoutSegments(segs, 4, true, plain)
+	if want := []string{"abcd", "efgh", "ij  ", "kl  "}; !slices.Equal(got, want) {
+		t.Errorf("wrap: %q, want %q", got, want)
+	}
+	got = layoutSegments(segs[:2], 6, false, plain)
+	if len(got) != 1 || got[0] != "abcde…" {
+		t.Errorf("cut: %q", got)
+	}
+}
+
+func TestLogViewWrapAndSearch(t *testing.T) {
+	v := newLogView("c", &unstructured.Unstructured{Object: map[string]any{}}, &config.Fields{})
+	v.rect = rect{0, 0, 40, 8} // 6 lines inside
+	var batch []logs.Entry
+	for i := range 10 {
+		batch = append(batch, logs.Parse(fmt.Sprintf("2026-10-09T10:00:%02dZ line %d %s", i, i, strings.Repeat("x", 60))))
+	}
+	batch[3] = logs.Parse("2026-10-09T10:00:03Z needle here")
+	v.onLines(logLinesMsg{gen: v.gen, entries: batch})
+	v.wrap = true
+	v.scroll()
+	if h := v.entryHeight(0); h < 2 {
+		t.Fatalf("a long entry takes %d lines wrapped", h)
+	}
+	if v.cursor != 9 || v.linesBetween(v.offset, v.cursor) > v.height() {
+		t.Errorf("the followed last entry is not on screen: offset %d", v.offset)
+	}
+	if got := strings.Count(v.View(), "\n"); got != v.rect.h-1 {
+		t.Errorf("view is %d lines high", got+1)
+	}
+	v.search = "NEEDLE"
+	if !v.jump(1) || v.cursor != 3 || v.follow {
+		t.Errorf("search jumped to %d", v.cursor)
+	}
+	if v.rowAt(0) != v.offset {
+		t.Error("the first line is not the offset row")
+	}
+}
+
+func TestLogRanges(t *testing.T) {
+	v := newLogView("c", &unstructured.Unstructured{Object: map[string]any{"metadata": map[string]any{"name": "p"}}}, &config.Fields{})
+	if s := v.sources(); len(s) != 0 {
+		t.Fatalf("a pod without containers streams %v", s)
+	}
+	v.pods[0].Object["spec"] = map[string]any{"containers": []any{map[string]any{"name": "c"}}}
+	v.containers, v.container = []string{"c"}, "c"
+	for key, want := range map[string]string{"0": "tail 500", "1": "all", "5": "since 30m", "6": "since 1h"} {
+		v.tail, v.since = logRanges[key].tail, logRanges[key].since
+		if got := v.rangeLabel(); got != want {
+			t.Errorf("%s: %q, want %q", key, got, want)
+		}
+	}
+	r := logRanges["3"]
+	v.tail, v.since = r.tail, r.since
+	req := v.sources()[0].req
+	if req.SinceSeconds != 300 || req.TailLines != 0 || v.rangeLabel() != "since 5m" {
+		t.Errorf("5m: %+v %q", req, v.rangeLabel())
+	}
+}
+
+func TestLogSave(t *testing.T) {
+	t.Chdir(t.TempDir())
+	v := newLogView("c", &unstructured.Unstructured{Object: map[string]any{"metadata": map[string]any{"name": "web-1"}}}, &config.Fields{})
+	v.rect = rect{0, 0, 80, 10}
+	v.onLines(logLinesMsg{gen: v.gen, entries: []logs.Entry{logs.Parse("2026-10-09T10:00:00Z hello"), logs.Parse("2026-10-09T10:00:01Z skip")}})
+	v.SetFilter("hello")
+	name, err := v.save(time.Date(2026, 10, 9, 12, 0, 0, 0, time.Local))
+	if err != nil {
+		t.Fatal(err)
+	}
+	b, _ := os.ReadFile(name)
+	if name != "web-1-all-20261009-120000.log" || string(b) != "2026-10-09T10:00:00Z hello\n" {
+		t.Errorf("%s: %q", name, b)
 	}
 }

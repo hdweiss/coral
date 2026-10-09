@@ -15,12 +15,16 @@ type LogRequest struct {
 	Previous                  bool  // the log of the previous, terminated container
 	Follow                    bool  // keep streaming new lines
 	TailLines                 int64 // lines from the end; 0 = all
+	SinceSeconds              int64 // only lines this recent; 0 = no limit
 }
 
 func (r LogRequest) options() *corev1.PodLogOptions {
 	o := &corev1.PodLogOptions{Container: r.Container, Previous: r.Previous, Follow: r.Follow, Timestamps: true}
 	if r.TailLines > 0 {
 		o.TailLines = &r.TailLines
+	}
+	if r.SinceSeconds > 0 {
+		o.SinceSeconds = &r.SinceSeconds
 	}
 	return o
 }

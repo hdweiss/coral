@@ -7,6 +7,7 @@ import (
 	"hash/fnv"
 	"image/color"
 	"io"
+	"os"
 	"slices"
 	"sort"
 	"strings"
@@ -61,6 +62,15 @@ type logView struct {
 	previous   bool
 	labelW     int // width of the source labels; 0 when there is one source
 
+	// What to fetch: since > 0 asks for the last since of log, else the
+	// last tail lines (0 = all), like k9s's 0–6 keys.
+	tail  int64
+	since time.Duration
+
+	wrap   bool   // entries wrap, multi-line messages in full (w)
+	noTime bool   // hide the time column (t)
+	search string // highlighted, n/N jump between matching lines (ctrl+s)
+
 	entries []logs.Entry
 	bytes   int   // raw text in entries
 	rows    []int // indices into entries that match the filter
@@ -85,7 +95,7 @@ func newLogView(ctx string, pod *unstructured.Unstructured, fields *config.Field
 
 // newWorkloadLogView shows the logs of pods, the pods of subject.
 func newWorkloadLogView(ctx string, subject *unstructured.Unstructured, pods []*unstructured.Unstructured, fields *config.Fields) *logView {
-	v := &logView{ctx: ctx, subject: subject, pods: pods, fields: fields, follow: true}
+	v := &logView{ctx: ctx, subject: subject, pods: pods, fields: fields, follow: true, tail: logTail}
 	for _, p := range pods {
 		for _, c := range k8s.Containers(p) {
 			if !slices.Contains(v.containers, c) {
@@ -123,7 +133,10 @@ func (v *logView) sources() []logSource {
 		for _, c := range names {
 			req := k8s.LogRequest{
 				Namespace: pod.GetNamespace(), Pod: pod.GetName(), Container: c,
-				Previous: v.previous, Follow: !v.previous, TailLines: logTail,
+				Previous: v.previous, Follow: !v.previous, TailLines: v.tail,
+			}
+			if v.since > 0 {
+				req.TailLines, req.SinceSeconds = 0, int64(v.since.Seconds())
 			}
 			label := c
 			if len(v.pods) > 1 {
@@ -411,9 +424,105 @@ func (v *logView) SetFilter(f string) {
 }
 
 // scroll keeps the cursor on screen without leaving empty rows at the bottom.
+// Wrapped entries take several lines, so then offset moves until the
+// cursor's entry fits below it.
 func (v *logView) scroll() {
-	v.offset = clamp(v.offset, 0, max(len(v.rows)-v.height(), 0))
-	v.offset = scrollTo(v.cursor, v.offset, v.height())
+	if !v.wrap {
+		v.offset = clamp(v.offset, 0, max(len(v.rows)-v.height(), 0))
+		v.offset = scrollTo(v.cursor, v.offset, v.height())
+		return
+	}
+	v.offset = clamp(v.offset, 0, max(len(v.rows)-1, 0))
+	if v.cursor < v.offset {
+		v.offset = v.cursor
+	}
+	for v.offset < v.cursor && v.linesBetween(v.offset, v.cursor) > v.height() {
+		v.offset++
+	}
+}
+
+// entryHeight is the number of lines row i takes.
+func (v *logView) entryHeight(i int) int {
+	if !v.wrap {
+		return 1
+	}
+	pins := v.pins()
+	return len(v.entryLines(&v.entries[v.rows[i]], pins, pinLabels(pins), false, v.rect.w-2))
+}
+
+// linesBetween counts the lines of rows from to to, inclusive.
+func (v *logView) linesBetween(from, to int) int {
+	n := 0
+	for i := from; i <= to && i < len(v.rows); i++ {
+		n += v.entryHeight(i)
+	}
+	return n
+}
+
+// lastVisible is the last row that starts on screen.
+func (v *logView) lastVisible() int {
+	n, i := 0, v.offset
+	for ; i < len(v.rows); i++ {
+		if n += v.entryHeight(i); n >= v.height() {
+			break
+		}
+	}
+	return min(i, len(v.rows)-1)
+}
+
+// rowAt returns the row drawn at line y of the view, or -1.
+func (v *logView) rowAt(y int) int {
+	n := 0
+	for i := v.offset; i < len(v.rows); i++ {
+		if n += v.entryHeight(i); y < n {
+			return i
+		}
+	}
+	return -1
+}
+
+// rangeLabel names what was fetched: "tail 500", "all", "1m".
+func (v *logView) rangeLabel() string {
+	switch {
+	case v.since > 0:
+		if v.since%time.Hour == 0 {
+			return fmt.Sprintf("since %dh", int(v.since.Hours()))
+		}
+		return fmt.Sprintf("since %dm", int(v.since.Minutes()))
+	case v.tail == 0:
+		return "all"
+	}
+	return fmt.Sprintf("tail %d", v.tail)
+}
+
+// logRanges are the 0–6 keys of the log view, as in k9s: tail, everything,
+// then the last 1m … 1h.
+var logRanges = map[string]struct {
+	tail  int64
+	since time.Duration
+}{
+	"0": {logTail, 0}, "1": {0, 0}, "2": {0, time.Minute}, "3": {0, 5 * time.Minute},
+	"4": {0, 15 * time.Minute}, "5": {0, 30 * time.Minute}, "6": {0, time.Hour},
+}
+
+// searchMatches reports whether entry i matches the search.
+func (v *logView) searchMatches(e *logs.Entry) bool {
+	return v.search != "" && strings.Contains(strings.ToLower(e.Raw), strings.ToLower(v.search))
+}
+
+// jump moves the cursor to the next (dir 1) or previous (-1) line matching
+// the search, wrapping around, and reports whether there was one.
+func (v *logView) jump(dir int) bool {
+	n := len(v.rows)
+	for k := 1; k <= n; k++ {
+		i := ((v.cursor+dir*k)%n + n) % n
+		if v.searchMatches(&v.entries[v.rows[i]]) {
+			v.cursor, v.follow = i, false
+			v.scroll()
+			return true
+		}
+	}
+	return false
 }
 
 func (v *logView) Selected() *logs.Entry {
@@ -445,7 +554,7 @@ func (v *logView) Update(msg tea.Msg) tea.Cmd {
 			v.follow = c >= len(v.rows)-1
 		}
 	case clickMsg:
-		i := v.offset + msg.y
+		i := v.rowAt(msg.y)
 		if i >= 0 && i < len(v.rows) {
 			v.cursor = i
 			v.follow = i == len(v.rows)-1
@@ -454,8 +563,12 @@ func (v *logView) Update(msg tea.Msg) tea.Cmd {
 			}
 		}
 	case wheelMsg:
-		v.offset = clamp(v.offset+msg.delta, 0, max(len(v.rows)-v.height(), 0))
-		v.cursor = clamp(v.cursor, v.offset, v.offset+v.height()-1)
+		maxOff := max(len(v.rows)-v.height(), 0)
+		if v.wrap {
+			maxOff = max(len(v.rows)-1, 0)
+		}
+		v.offset = clamp(v.offset+msg.delta, 0, maxOff)
+		v.cursor = clamp(v.cursor, v.offset, v.lastVisible())
 		v.cursor = clamp(v.cursor, 0, len(v.rows)-1)
 		v.follow = v.cursor == len(v.rows)-1 && msg.delta > 0
 		return nil
@@ -505,12 +618,19 @@ func (v *logView) View() string {
 	pins := v.pins()
 	labels := pinLabels(pins)
 	for i := v.offset; i < len(v.rows) && len(lines) < v.height(); i++ {
-		lines = append(lines, v.renderLine(&v.entries[v.rows[i]], pins, labels, i == v.cursor, iw))
+		lines = append(lines, v.entryLines(&v.entries[v.rows[i]], pins, labels, i == v.cursor, iw)...)
 	}
+	lines = lines[:min(len(lines), v.height())]
 
-	var footer []string
+	footer := []string{v.rangeLabel()}
 	if v.filter != "" {
 		footer = append(footer, "/"+v.filter)
+	}
+	if v.search != "" {
+		footer = append(footer, "search: "+v.search+" (n/N)")
+	}
+	if v.wrap {
+		footer = append(footer, "wrap")
 	}
 	switch {
 	case v.err != nil:
@@ -591,12 +711,25 @@ func levelStyle(l string) lipgloss.Style {
 	return lipgloss.NewStyle()
 }
 
-// renderLine draws an entry as: time, level, pinned fields, message.
-func (v *logView) renderLine(e *logs.Entry, pins, labels []string, selected bool, w int) string {
-	var plain, styled strings.Builder
+// segment is a piece of a log line in one style; "\n" alone breaks the line.
+type segment struct {
+	s  string
+	st lipgloss.Style
+}
+
+// entryLines draws an entry as: source, time, level, pinned fields,
+// message. It is one line cut to w, or with wrap on, the whole message
+// wrapped to w. Search matches are highlighted.
+func (v *logView) entryLines(e *logs.Entry, pins, labels []string, selected bool, w int) []string {
+	var segs []segment
 	part := func(s string, st lipgloss.Style) {
-		plain.WriteString(s)
-		styled.WriteString(st.Render(s))
+		if selected {
+			st = stSelLo
+			if v.focused {
+				st = stSel
+			}
+		}
+		segs = append(segs, v.highlight(s, st)...)
 	}
 	none := lipgloss.NewStyle()
 
@@ -604,7 +737,7 @@ func (v *logView) renderLine(e *logs.Entry, pins, labels []string, selected bool
 	if v.labelW > 0 {
 		part(fmt.Sprintf("%-*s ", v.labelW, e.Source), sourceStyle(e.Source))
 	}
-	if !e.Time.IsZero() {
+	if !e.Time.IsZero() && !v.noTime {
 		part(e.Time.Local().Format("15:04:05.000")+" ", stMuted)
 	}
 	lvl := e.Level
@@ -626,19 +759,97 @@ func (v *logView) renderLine(e *logs.Entry, pins, labels []string, selected bool
 	if e.Format != logs.Plain && msg == "" {
 		msg = e.Raw
 	}
-	part(firstLine(msg), none)
-	if strings.Contains(msg, "\n") {
-		part(" ⏎", stMuted)
-	}
-
-	if selected {
-		st := stSelLo
-		if v.focused {
-			st = stSel
+	if v.wrap {
+		for i, l := range strings.Split(msg, "\n") {
+			if i > 0 {
+				segs = append(segs, segment{s: "\n"})
+				part("  ", none)
+			}
+			part(untab(l), none)
 		}
-		return st.Render(fit(plain.String(), w))
+	} else {
+		part(firstLine(msg), none)
+		if strings.Contains(msg, "\n") {
+			part(" ⏎", stMuted)
+		}
 	}
-	return fit(styled.String(), w)
+	fill := none
+	if selected {
+		fill = segs[0].st
+	}
+	return layoutSegments(segs, w, v.wrap, fill)
+}
+
+// highlight splits s into segments in st, with the search matches in the
+// search style.
+func (v *logView) highlight(s string, st lipgloss.Style) []segment {
+	if v.search == "" {
+		return []segment{{s, st}}
+	}
+	var out []segment
+	lower, q := strings.ToLower(s), strings.ToLower(v.search)
+	for {
+		i := strings.Index(lower, q)
+		if i < 0 || len(lower) != len(s) { // ToLower changed byte offsets: no highlight
+			return append(out, segment{s, st})
+		}
+		if i > 0 {
+			out = append(out, segment{s[:i], st})
+		}
+		out = append(out, segment{s[i : i+len(q)], st.Background(colYellow).Foreground(colBarBg)})
+		s, lower = s[i+len(q):], lower[i+len(q):]
+		if s == "" {
+			return out
+		}
+	}
+}
+
+// layoutSegments renders segments into lines of width w: wrapped, or one
+// line cut with an ellipsis. Lines are padded to w in fill, so that a
+// selected entry is highlighted across the panel.
+func layoutSegments(segs []segment, w int, wrap bool, fill lipgloss.Style) []string {
+	var lines []string
+	var cur strings.Builder
+	used := 0
+	flush := func() {
+		line := cur.String()
+		if used > w {
+			line, used = ansi.Truncate(line, w, "…"), w
+		}
+		lines = append(lines, line+fill.Render(strings.Repeat(" ", max(w-used, 0))))
+		cur.Reset()
+		used = 0
+	}
+	for _, sg := range segs {
+		if sg.s == "\n" {
+			flush()
+			continue
+		}
+		if !wrap {
+			cur.WriteString(sg.st.Render(sg.s))
+			used += ansi.StringWidth(sg.s)
+			continue
+		}
+		for rest := sg.s; rest != ""; {
+			if used >= w {
+				flush()
+			}
+			piece := ansi.Truncate(rest, w-used, "")
+			if piece == "" { // a wide rune at the end of a line
+				if used == 0 {
+					piece = string([]rune(rest)[0])
+				} else {
+					flush()
+					continue
+				}
+			}
+			cur.WriteString(sg.st.Render(piece))
+			used += ansi.StringWidth(piece)
+			rest = rest[len(piece):]
+		}
+	}
+	flush()
+	return lines
 }
 
 // sourceStyle colors a source label, the same label always the same way.
@@ -654,4 +865,27 @@ func firstLine(s string) string {
 		s = s[:i]
 	}
 	return untab(s)
+}
+
+// save writes the shown lines (after the filter) to a file in the current
+// directory, each with its kubelet timestamp and, when the view merges
+// several logs, its source. It returns the file's name.
+func (v *logView) save(now time.Time) (string, error) {
+	c := v.container
+	if c == "" {
+		c = "all"
+	}
+	name := fmt.Sprintf("%s-%s-%s.log", v.subject.GetName(), c, now.Format("20060102-150405"))
+	var b strings.Builder
+	for _, r := range v.rows {
+		e := &v.entries[r]
+		if !e.KubeTime.IsZero() {
+			b.WriteString(e.KubeTime.UTC().Format(time.RFC3339Nano) + " ")
+		}
+		if v.labelW > 0 {
+			b.WriteString("[" + e.Source + "] ")
+		}
+		b.WriteString(e.Raw + "\n")
+	}
+	return name, os.WriteFile(name, []byte(b.String()), 0o644)
 }

@@ -106,6 +106,7 @@ type App struct {
 	schemaLoading map[string]bool // detail schema lookups in flight
 	builtin       *schema.Builtin
 	filtering     bool
+	searching     bool // the filter input searches the log view instead (ctrl+s)
 	filterInput   textinput.Model
 	help          bool
 
@@ -893,12 +894,31 @@ func (a *App) handleKey(msg tea.KeyPressMsg) tea.Cmd {
 			return nil
 		case "enter":
 			a.stopFilter(false)
+			if a.searching {
+				a.searching = false
+				if a.logs != nil && a.logs.search != "" && !a.logs.searchMatches(a.logs.Selected()) && !a.logs.jump(-1) {
+					a.setFlash("no line matches “"+a.logs.search+"”", true)
+				}
+				a.syncDetail()
+			}
 			return nil
 		}
 		var cmd tea.Cmd
 		a.filterInput, cmd = a.filterInput.Update(msg)
+		if a.searching {
+			if a.logs != nil {
+				a.logs.search = a.filterInput.Value()
+			}
+			return cmd
+		}
 		a.setFilter(a.filterInput.Value())
 		return cmd
+	}
+
+	// The log view's 0–6 pick what to fetch, as in k9s, instead of the
+	// namespace and pin keys.
+	if _, ok := logRanges[key]; ok && a.logs != nil && a.focus == focusTable {
+		return a.logKey(msg)
 	}
 
 	if a.help {
@@ -1134,6 +1154,41 @@ func (a *App) logKey(msg tea.KeyPressMsg) tea.Cmd {
 		a.zoom = !a.zoom
 		a.layout()
 		return nil
+	case "w":
+		a.logs.wrap = !a.logs.wrap
+		a.logs.scroll()
+		return nil
+	case "t":
+		a.logs.noTime = !a.logs.noTime
+		return nil
+	case "ctrl+s":
+		return a.startSearch()
+	case "ctrl+w":
+		name, err := a.logs.save(time.Now())
+		if err != nil {
+			a.setFlash("saving the log: "+err.Error(), true)
+		} else {
+			a.setFlash(fmt.Sprintf("saved %d lines to %s", len(a.logs.rows), name), false)
+		}
+		return nil
+	case "n", "N":
+		if a.logs.search == "" {
+			return a.startSearch()
+		}
+		dir := 1
+		if msg.String() == "N" {
+			dir = -1
+		}
+		if !a.logs.jump(dir) {
+			a.setFlash("no line matches “"+a.logs.search+"”", true)
+		}
+		a.syncDetail()
+		return nil
+	}
+	if r, ok := logRanges[msg.String()]; ok {
+		a.logs.tail, a.logs.since = r.tail, r.since
+		a.setFlash("logs: "+a.logs.rangeLabel(), false)
+		return a.logs.start(a.store.Provider())
 	}
 	cmd := a.logs.Update(msg)
 	a.syncDetail()
@@ -1171,9 +1226,26 @@ func (a *App) startFilter() tea.Cmd {
 func (a *App) stopFilter(clear bool) {
 	a.filtering = false
 	a.filterInput.Blur()
+	a.filterInput.Prompt = "/"
+	if clear && a.searching {
+		a.searching = false
+		if a.logs != nil {
+			a.logs.search = ""
+		}
+		return
+	}
 	if clear {
 		a.setFilter("")
 	}
+}
+
+// startSearch asks for a term to highlight in the log view (ctrl+s).
+func (a *App) startSearch() tea.Cmd {
+	a.filtering, a.searching = true, true
+	a.filterInput.Prompt = "search: "
+	a.filterInput.SetValue(a.logs.search)
+	a.filterInput.CursorEnd()
+	return a.filterInput.Focus()
 }
 
 func (a *App) handleMouse(msg tea.MouseMsg) tea.Cmd {
@@ -1720,7 +1792,9 @@ func (a *App) renderStatus() string {
 		if a.logs != nil {
 			logKey := func(m tea.Msg) tea.Cmd { return a.logKey(m.(tea.KeyPressMsg)) }
 			hints = append(hints, hint{"esc", "back", func() tea.Cmd { a.closeLogs(); return nil }},
-				hint{"s", "autoscroll", press(logKey, plainKey('s'))}, hint{"p", "previous", a.previousLogs})
+				hint{"s", "autoscroll", press(logKey, plainKey('s'))}, hint{"p", "previous", a.previousLogs},
+				hint{"w", "wrap", press(logKey, plainKey('w'))}, hint{"^s", "search", a.startSearch},
+				hint{"0-6", "range", nil})
 			if len(a.logs.containers) > 1 {
 				hints = append(hints, hint{"c", "container", press(logKey, plainKey('c'))})
 			}
@@ -1783,7 +1857,9 @@ func (a *App) renderStatus() string {
 	for _, h := range hints {
 		s := stBarKey.Render(" "+h.key) + stBarText.Render(" "+h.label+" ")
 		w := ansi.StringWidth(s)
-		a.buttons = append(a.buttons, button{x0: x, x1: x + w, y: y, run: h.run})
+		if h.run != nil {
+			a.buttons = append(a.buttons, button{x0: x, x1: x + w, y: y, run: h.run})
+		}
 		sb.WriteString(s)
 		x += w
 	}
@@ -1843,7 +1919,11 @@ func helpView(w, h int) string {
 			{"ctrl+p", "in the entry: pin the field to every log line"},
 			{"s G", "toggle autoscroll / jump to the end and follow"},
 			{"f", "fullscreen"},
-			{"c", "next container"},
+			{"c", "all containers → each container"},
+			{"0 1 2-6", "last 500 lines / everything / the last 1m 5m 15m 30m 1h"},
+			{"w t", "wrap long and multi-line entries / hide the time"},
+			{"ctrl+s n N", "search: highlight a term, jump to the next / previous match"},
+			{"ctrl+w", "save the shown lines to ./<pod>-<container>-<time>.log"},
 		}},
 		{"Events and describe", [][2]string{
 			{"E", "events of the selected object, newest first (again or esc to close)"},
