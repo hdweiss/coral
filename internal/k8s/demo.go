@@ -216,6 +216,17 @@ type app struct {
 	configMap       string
 	secret          string
 	pvc             string
+	proxy           bool // a Linkerd proxy sidecar, injected as the first container
+}
+
+const linkerdProxy = "linkerd-proxy"
+
+func proxyContainer() m {
+	return m{
+		"name": linkerdProxy, "image": "cr.l5d.io/linkerd/proxy:edge-26.9.2", "imagePullPolicy": "IfNotPresent",
+		"ports":     l{m{"name": "linkerd-proxy", "containerPort": int64(4143), "protocol": "TCP"}, m{"name": "linkerd-admin", "containerPort": int64(4191), "protocol": "TCP"}},
+		"resources": m{"requests": m{"cpu": "10m", "memory": "20Mi"}},
+	}
 }
 
 func (a app) labels() map[string]string {
@@ -262,8 +273,12 @@ func (a app) container() m {
 }
 
 func (a app) podSpec() m {
+	containers := l{a.container()}
+	if a.proxy {
+		containers = l{proxyContainer(), a.container()}
+	}
 	spec := m{
-		"containers":                    l{a.container()},
+		"containers":                    containers,
 		"restartPolicy":                 "Always",
 		"terminationGracePeriodSeconds": int64(30),
 		"serviceAccountName":            "default",
@@ -326,6 +341,10 @@ func (d *demo) pod(a app, name string, age time.Duration, owner *unstructured.Un
 	}
 	if cs != nil {
 		status["containerStatuses"] = l{cs}
+		if a.proxy {
+			status["containerStatuses"] = l{m{"name": linkerdProxy, "image": "cr.l5d.io/linkerd/proxy:edge-26.9.2", "ready": true, "restartCount": int64(0),
+				"started": true, "state": m{"running": m{"startedAt": d.ts(age)}}}, cs}
+		}
 		status["podIP"] = fmt.Sprintf("10.244.%d.%d", len(d.objs)%3+1, len(d.objs)%250+2)
 		status["hostIP"] = "192.168.1.1" + node[len(node)-1:]
 		r := "True"
@@ -345,6 +364,9 @@ func (d *demo) pod(a app, name string, age time.Duration, owner *unstructured.Un
 	labels := a.labels()
 	labels["pod-template-hash"] = hash(a.name, 10)
 	p := d.add("v1", "Pod", a.ns, name, age, labels, m{"spec": spec, "status": status})
+	if a.proxy {
+		p.SetAnnotations(map[string]string{"linkerd.io/inject": "enabled", "linkerd.io/proxy-version": "edge-26.9.2"})
+	}
 	if owner != nil {
 		p.Object["metadata"].(m)["ownerReferences"] = ownerRef(owner)
 	}
@@ -617,7 +639,7 @@ func buildDemoCluster(name string) []runtime.Object {
 		paymentStates = nil
 	}
 	d.deployment(app{ns: "payments", name: "payments-api", image: "ghcr.io/acme/payments:5.2.0", port: 8443, replicas: 2,
-		states: paymentStates, secret: "stripe"}, 20*day)
+		states: paymentStates, secret: "stripe", proxy: true}, 20*day)
 	d.deployment(app{ns: "payments", name: "fraud-check", image: "ghcr.io/acme/fraud-check:0.9.1-typo", port: 8080, replicas: 1,
 		states: []podState{pull}}, 2*time.Hour)
 	d.service("payments", "payments-api", "ClusterIP", 8443, "payments-api")

@@ -52,6 +52,10 @@ type Entry struct {
 	// so that both spellings are the same field. Plain lines have just
 	// "message".
 	Fields map[string]any
+
+	// Source names the stream the line came from, in a view that merges
+	// several (a container, or a pod of a workload); set by the caller.
+	Source string
 }
 
 // Parse parses a line as returned by the API with timestamps=true:

@@ -34,13 +34,20 @@ func (p *demoProvider) Logs(ctx context.Context, kctx string, req LogRequest) (i
 	if app == "" {
 		app = pod.GetLabels()["app.kubernetes.io/name"]
 	}
+	if req.Container == linkerdProxy {
+		app, crashing = linkerdProxy, false
+	}
 	h := fnv.New64a()
 	h.Write([]byte(req.Pod + "/" + req.Container))
 	g := &demoLog{app: app, pod: req.Pod, rng: rand.New(rand.NewPCG(h.Sum64(), 1)), crashing: crashing}
 
 	pr, pw := io.Pipe()
 	go func() {
-		n := 300
+		n, every, wait := 300, 1700*time.Millisecond, 150
+		if app == linkerdProxy {
+			// Quiet, like a real proxy once it is up.
+			n, every, wait = 40, time.Minute, 6000
+		}
 		if req.TailLines > 0 {
 			n = min(n, int(req.TailLines))
 		}
@@ -50,7 +57,7 @@ func (p *demoProvider) Logs(ctx context.Context, kctx string, req LogRequest) (i
 			return err == nil
 		}
 		for i := n; i > 0; i-- {
-			t := now.Add(-time.Duration(i)*1700*time.Millisecond - time.Duration(g.rng.IntN(900))*time.Millisecond)
+			t := now.Add(-time.Duration(i)*every - time.Duration(g.rng.IntN(900))*time.Millisecond)
 			if !write(t, g.line(t, req.Previous && i < 4)) {
 				return
 			}
@@ -64,7 +71,7 @@ func (p *demoProvider) Logs(ctx context.Context, kctx string, req LogRequest) (i
 			case <-ctx.Done():
 				pw.Close()
 				return
-			case <-time.After(time.Duration(150+g.rng.IntN(1200)) * time.Millisecond):
+			case <-time.After(time.Duration(wait+g.rng.IntN(1200)) * time.Millisecond):
 				t := time.Now()
 				if !write(t, g.line(t, false)) {
 					return
@@ -101,6 +108,11 @@ func (g *demoLog) line(t time.Time, dying bool) string {
 		return g.ecs(t, dying)
 	case "fraud-check":
 		return g.zap(t)
+	case linkerdProxy:
+		return fmt.Sprintf("[%12.6fs]  %s ThreadId(%02d) %s", float64(g.seq)*61.3, g.pick("INFO", "INFO", "WARN"), 1+g.rng.IntN(4),
+			g.pick("inbound:server{port=8443}: linkerd_app_inbound::policy::http: Request authorized",
+				"outbound:proxy{addr=10.96.4.12:5432}: linkerd_reconnect: Failed to connect error=connect timed out after 1s",
+				"daemon:identity: linkerd_app: Certified identity id=payments-api.payments.serviceaccount.identity.linkerd.cluster.local"))
 	case "frontend":
 		return g.nginx(t)
 	case "redis":

@@ -4,11 +4,18 @@ import (
 	"bufio"
 	"context"
 	"fmt"
+	"hash/fnv"
+	"image/color"
 	"io"
+	"slices"
+	"sort"
 	"strings"
+	"sync"
+	"time"
 
 	tea "charm.land/bubbletea/v2"
 	"charm.land/lipgloss/v2"
+	"github.com/charmbracelet/x/ansi"
 	"github.com/hdweiss/coral/internal/config"
 	"github.com/hdweiss/coral/internal/k8s"
 	"github.com/hdweiss/coral/internal/logs"
@@ -39,7 +46,8 @@ type logLinesMsg struct {
 
 // logView shows a container log in place of the table. Each line shows the
 // time, level, pinned fields and message; the detail panel shows the selected
-// entry as a tree.
+// entry as a tree. A pod with several containers shows them all, merged by
+// time and each line labelled with its container, until c picks one.
 type logView struct {
 	rect    rect
 	focused bool
@@ -47,8 +55,9 @@ type logView struct {
 	ctx        string // kube context
 	pod        *unstructured.Unstructured
 	containers []string
-	container  string
+	container  string // "" = all containers that have a log
 	previous   bool
+	labelW     int // width of the source labels; 0 when there is one source
 
 	entries []logs.Entry
 	bytes   int   // raw text in entries
@@ -70,10 +79,40 @@ type logView struct {
 
 func newLogView(ctx string, pod *unstructured.Unstructured, fields *config.Fields) *logView {
 	v := &logView{ctx: ctx, pod: pod, containers: k8s.Containers(pod), fields: fields, follow: true}
-	if len(v.containers) > 0 {
+	// One container, or the one the default-container annotation names;
+	// otherwise all of them, so that a sidecar listed first (Linkerd's and
+	// Istio's proxies are) doesn't hide the app's log.
+	if len(v.containers) == 1 || pod.GetAnnotations()["kubectl.kubernetes.io/default-container"] != "" {
 		v.container = v.containers[0]
 	}
 	return v
+}
+
+// logSource is one container log that a view streams.
+type logSource struct {
+	req   k8s.LogRequest
+	label string // put before its lines when there are several sources
+}
+
+// sources lists the logs the view streams: the selected container, or all
+// containers that have a log.
+func (v *logView) sources() []logSource {
+	names := []string{v.container}
+	if v.container == "" {
+		names = k8s.LogContainers(v.pod)
+	}
+	var out []logSource
+	for _, c := range names {
+		req := k8s.LogRequest{
+			Namespace: v.pod.GetNamespace(), Pod: v.pod.GetName(), Container: c,
+			Previous: v.previous, Follow: !v.previous, TailLines: logTail,
+		}
+		out = append(out, logSource{req: req, label: c})
+	}
+	if len(out) == 1 {
+		out[0].label = ""
+	}
+	return out
 }
 
 // start (re)opens the stream for the current container, dropping what was
@@ -85,44 +124,74 @@ func (v *logView) start(p k8s.Provider) tea.Cmd {
 	v.follow, v.loading, v.ended, v.err = true, true, false, nil
 	ctx, cancel := context.WithCancel(context.Background())
 	v.cancel = cancel
-	req := k8s.LogRequest{
-		Namespace: v.pod.GetNamespace(), Pod: v.pod.GetName(), Container: v.container,
-		Previous: v.previous, Follow: !v.previous, TailLines: logTail,
-	}
 	gen, kctx := v.gen, v.ctx
+	srcs := v.sources()
+	v.labelW = 0
+	for _, s := range srcs {
+		v.labelW = max(v.labelW, ansi.StringWidth(s.label))
+	}
 
-	// A goroutine reads and parses lines into ch, off the UI goroutine since
-	// parsing JSON is the expensive part; read hands them over in batches. The
-	// first read only waits for the stream to open, so that an empty log
-	// shows as such instead of loading forever.
+	// A goroutine per source reads and parses lines into ch, off the UI
+	// goroutine since parsing JSON is the expensive part; read hands them
+	// over in batches. The first read only waits for the streams to open, so
+	// that an empty log shows as such instead of loading forever. With one
+	// source its error ends the view; with several, it becomes a line, since
+	// one container failing (not started yet, say) shouldn't hide the others.
 	ch := make(chan logs.Entry, 4096)
 	opened := make(chan struct{})
 	var streamErr error
-	go func() {
-		defer close(ch)
-		r, err := p.Logs(ctx, kctx, req)
-		if err != nil {
-			streamErr = err
-			close(opened)
-			return
-		}
-		close(opened)
-		defer r.Close()
-		br := bufio.NewReaderSize(r, 64*1024)
-		for {
-			line, err := logs.ReadLine(br, logMaxLineSz)
-			if err != nil {
-				if err != io.EOF && ctx.Err() == nil {
+	var wg, opening sync.WaitGroup
+	for _, src := range srcs {
+		wg.Add(1)
+		opening.Add(1)
+		go func() {
+			defer wg.Done()
+			fail := func(err error) {
+				if len(srcs) == 1 {
 					streamErr = err
+					return
 				}
+				e := logs.Entry{Raw: err.Error(), Level: "ERROR", Message: "log stream: " + err.Error(), Source: src.label}
+				e.KubeTime, e.Time = time.Now(), time.Now()
+				e.Fields = map[string]any{"message": e.Message}
+				select {
+				case ch <- e:
+				case <-ctx.Done():
+				}
+			}
+			r, err := p.Logs(ctx, kctx, src.req)
+			opening.Done()
+			if err != nil {
+				fail(err)
 				return
 			}
-			select {
-			case ch <- logs.Parse(line):
-			case <-ctx.Done():
-				return
+			defer r.Close()
+			br := bufio.NewReaderSize(r, 64*1024)
+			for {
+				line, err := logs.ReadLine(br, logMaxLineSz)
+				if err != nil {
+					if err != io.EOF && ctx.Err() == nil {
+						fail(err)
+					}
+					return
+				}
+				e := logs.Parse(line)
+				e.Source = src.label
+				select {
+				case ch <- e:
+				case <-ctx.Done():
+					return
+				}
 			}
-		}
+		}()
+	}
+	go func() {
+		opening.Wait()
+		close(opened)
+	}()
+	go func() {
+		wg.Wait()
+		close(ch)
 	}()
 	waitOpen := true
 	var read tea.Cmd
@@ -168,14 +237,18 @@ func (v *logView) onLines(msg logLinesMsg) tea.Cmd {
 		return nil
 	}
 	v.loading = false
-	for _, e := range msg.entries {
-		v.entries = append(v.entries, e)
-		v.bytes += len(e.Raw)
-		if v.matches(&v.entries[len(v.entries)-1]) {
-			v.rows = append(v.rows, len(v.entries)-1)
+	if v.labelW > 0 && v.merge(msg.entries) {
+		v.trim()
+	} else {
+		for _, e := range msg.entries {
+			v.entries = append(v.entries, e)
+			v.bytes += len(e.Raw)
+			if v.matches(&v.entries[len(v.entries)-1]) {
+				v.rows = append(v.rows, len(v.entries)-1)
+			}
 		}
+		v.trim()
 	}
-	v.trim()
 	if v.follow {
 		v.cursor = max(len(v.rows)-1, 0)
 	}
@@ -185,6 +258,56 @@ func (v *logView) onLines(msg logLinesMsg) tea.Cmd {
 		return nil
 	}
 	return v.read
+}
+
+// merge adds a batch from several streams in time order, reporting false when
+// it is already in order after the existing entries (the common case once
+// the streams are running), which the caller appends as usual. Each stream
+// is in order on its own, but their first tails and later batches
+// interleave.
+func (v *logView) merge(batch []logs.Entry) bool {
+	if len(batch) == 0 {
+		return false
+	}
+	var last time.Time
+	if n := len(v.entries); n > 0 {
+		last = v.entries[n-1].KubeTime
+	}
+	inOrder := true
+	for i := range batch {
+		if batch[i].KubeTime.IsZero() {
+			batch[i].KubeTime = last // keep it next to its neighbour
+		}
+		if batch[i].KubeTime.Before(last) {
+			inOrder = false
+		}
+		last = batch[i].KubeTime
+	}
+	if inOrder {
+		return false
+	}
+	var sel *logs.Entry
+	if e := v.Selected(); e != nil && !v.follow {
+		cp := *e
+		sel = &cp
+	}
+	first := slices.MinFunc(batch, func(a, b logs.Entry) int { return a.KubeTime.Compare(b.KubeTime) }).KubeTime
+	from := sort.Search(len(v.entries), func(i int) bool { return v.entries[i].KubeTime.After(first) })
+	for _, e := range batch {
+		v.bytes += len(e.Raw)
+	}
+	v.entries = append(v.entries, batch...)
+	slices.SortStableFunc(v.entries[from:], func(a, b logs.Entry) int { return a.KubeTime.Compare(b.KubeTime) })
+	v.rebuild()
+	if sel != nil {
+		for i, r := range v.rows {
+			if e := &v.entries[r]; r >= from && e.KubeTime.Equal(sel.KubeTime) && e.Source == sel.Source && e.Raw == sel.Raw {
+				v.cursor = i
+				break
+			}
+		}
+	}
+	return true
 }
 
 // trim drops the oldest entries once there are more than logMaxLines or
@@ -276,19 +399,16 @@ func (v *logView) Selected() *logs.Entry {
 
 func (v *logView) height() int { return v.rect.h - 2 }
 
-// nextContainer switches to the next container, reporting whether there is
-// another one.
+// nextContainer cycles through all containers and each one, reporting
+// whether there is more than one.
 func (v *logView) nextContainer() bool {
 	if len(v.containers) < 2 {
 		return false
 	}
-	for i, c := range v.containers {
-		if c == v.container {
-			v.container = v.containers[(i+1)%len(v.containers)]
-			return true
-		}
-	}
-	return false
+	cycle := append([]string{""}, v.containers...)
+	i := slices.Index(cycle, v.container)
+	v.container = cycle[(i+1)%len(cycle)]
+	return true
 }
 
 func (v *logView) Update(msg tea.Msg) tea.Cmd {
@@ -321,7 +441,11 @@ func (v *logView) Update(msg tea.Msg) tea.Cmd {
 func (v *logView) title() string {
 	t := "Logs " + v.pod.GetName()
 	if len(v.containers) > 1 {
-		t += " (" + v.container + ")"
+		c := v.container
+		if c == "" {
+			c = "all containers"
+		}
+		t += " (" + c + ")"
 	}
 	if v.previous {
 		t += " previous"
@@ -448,6 +572,9 @@ func (v *logView) renderLine(e *logs.Entry, pins, labels []string, selected bool
 	none := lipgloss.NewStyle()
 
 	part(" ", none)
+	if v.labelW > 0 {
+		part(fmt.Sprintf("%-*s ", v.labelW, e.Source), sourceStyle(e.Source))
+	}
 	if !e.Time.IsZero() {
 		part(e.Time.Local().Format("15:04:05.000")+" ", stMuted)
 	}
@@ -483,6 +610,14 @@ func (v *logView) renderLine(e *logs.Entry, pins, labels []string, selected bool
 		return st.Render(fit(plain.String(), w))
 	}
 	return fit(styled.String(), w)
+}
+
+// sourceStyle colors a source label, the same label always the same way.
+func sourceStyle(label string) lipgloss.Style {
+	cols := []color.Color{colCyan, colPurple, colBlue, colOrange, colGreen, colYellow}
+	h := fnv.New32a()
+	h.Write([]byte(label))
+	return lipgloss.NewStyle().Foreground(cols[h.Sum32()%uint32(len(cols))])
 }
 
 func firstLine(s string) string {

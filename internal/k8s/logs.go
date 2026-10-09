@@ -46,3 +46,44 @@ func Containers(pod *unstructured.Unstructured) []string {
 	}
 	return names
 }
+
+// LogContainers lists the containers of a pod that have a log to show, in
+// Containers order: those that run or ran (state or last state running or
+// terminated). A pod none of whose containers started yet gets its regular
+// containers, so that the view can say why there is no log.
+func LogContainers(pod *unstructured.Unstructured) []string {
+	started := map[string]bool{}
+	for _, field := range []string{"containerStatuses", "initContainerStatuses", "ephemeralContainerStatuses"} {
+		list, _, _ := unstructured.NestedSlice(pod.Object, "status", field)
+		for _, c := range list {
+			m, ok := c.(map[string]any)
+			if !ok {
+				continue
+			}
+			for _, st := range []string{"state", "lastState"} {
+				s, _ := m[st].(map[string]any)
+				if s["running"] != nil || s["terminated"] != nil {
+					name, _ := m["name"].(string)
+					started[name] = true
+				}
+			}
+		}
+	}
+	var out []string
+	for _, n := range Containers(pod) {
+		if started[n] {
+			out = append(out, n)
+		}
+	}
+	if len(out) == 0 {
+		list, _, _ := unstructured.NestedSlice(pod.Object, "spec", "containers")
+		for _, c := range list {
+			if m, ok := c.(map[string]any); ok {
+				if n, ok := m["name"].(string); ok {
+					out = append(out, n)
+				}
+			}
+		}
+	}
+	return out
+}

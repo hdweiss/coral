@@ -2,6 +2,7 @@ package ui
 
 import (
 	"context"
+	"fmt"
 	"slices"
 	"strings"
 	"testing"
@@ -89,5 +90,90 @@ func TestLogViewTrims(t *testing.T) {
 	want := logMaxBytes / len(long)
 	if len(v.entries) != want || v.bytes != want*len(long) || v.cursor != want-1 {
 		t.Errorf("by bytes: %d entries (want %d), %d bytes, cursor %d", len(v.entries), want, v.bytes, v.cursor)
+	}
+}
+
+// A pod whose first container is a sidecar shows every container's log,
+// merged by time and labelled, and c cycles through them.
+func TestLogViewMergesContainers(t *testing.T) {
+	p := k8s.NewDemoProvider(nil)
+	c, _ := p.Client("demo-dev")
+	list, err := c.Resource(k8s.MustLookup("pods").GVR()).Namespace("payments").List(context.Background(), metav1.ListOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var pod *unstructured.Unstructured
+	for i := range list.Items {
+		if list.Items[i].GetLabels()["app"] == "payments-api" && k8s.PodStatus(&list.Items[i]) == "Running" {
+			pod = &list.Items[i]
+		}
+	}
+	if pod == nil || k8s.Containers(pod)[0] != "linkerd-proxy" {
+		t.Fatal("no demo pod with a proxy sidecar first")
+	}
+	v := newLogView("demo-dev", pod, &config.Fields{})
+	v.rect = rect{0, 0, 140, 20}
+	if v.container != "" {
+		t.Fatalf("opened on container %q, want all", v.container)
+	}
+	read := func() {
+		t.Helper()
+		cmd := v.start(p)
+		for sources := map[string]bool{}; len(sources) < 2 || len(v.entries) < 300; {
+			msg := cmd().(logLinesMsg)
+			if cmd = v.onLines(msg); cmd == nil {
+				t.Fatalf("stream ended with %d lines from %v", len(v.entries), sources)
+			}
+			for _, e := range v.entries {
+				sources[e.Source] = true
+			}
+		}
+		v.stop()
+	}
+	read()
+	if !slices.IsSortedFunc(v.entries, func(a, b logs.Entry) int { return a.KubeTime.Compare(b.KubeTime) }) {
+		t.Error("merged lines are not in time order")
+	}
+	if !strings.Contains(v.View(), "payments-api ") || !strings.Contains(v.title(), "all containers") {
+		t.Errorf("lines are not labelled:\n%s", v.View())
+	}
+
+	v.nextContainer()
+	if v.container != "linkerd-proxy" {
+		t.Errorf("c went to %q", v.container)
+	}
+	cmd := v.start(p)
+	defer v.stop()
+	for len(v.entries) < 40 {
+		if cmd = v.onLines(cmd().(logLinesMsg)); cmd == nil {
+			break
+		}
+	}
+	if v.labelW != 0 || v.entries[0].Source != "" {
+		t.Error("a single container's lines are labelled")
+	}
+}
+
+func TestLogViewMergeKeepsSelection(t *testing.T) {
+	v := newLogView("c", &unstructured.Unstructured{Object: map[string]any{}}, &config.Fields{})
+	v.rect = rect{0, 0, 100, 20}
+	v.labelW = 3
+	at := func(sec int, src string) logs.Entry {
+		e := logs.Parse(fmt.Sprintf("2026-10-09T10:00:%02dZ line %d", sec, sec))
+		e.Source = src
+		return e
+	}
+	v.onLines(logLinesMsg{gen: v.gen, entries: []logs.Entry{at(1, "a"), at(3, "a"), at(5, "a")}})
+	v.cursor, v.follow = 1, false // on 3
+	v.onLines(logLinesMsg{gen: v.gen, entries: []logs.Entry{at(2, "b"), at(4, "b")}})
+	var got []string
+	for _, e := range v.entries {
+		got = append(got, e.Raw)
+	}
+	if want := []string{"line 1", "line 2", "line 3", "line 4", "line 5"}; !slices.Equal(got, want) {
+		t.Errorf("order %v", got)
+	}
+	if e := v.Selected(); e == nil || e.Raw != "line 3" {
+		t.Errorf("selection moved to %+v", e)
 	}
 }
