@@ -30,8 +30,9 @@ type detailView struct {
 
 	// log is the log entry shown instead of an object while the log view is
 	// open; obj then wraps its fields. Favorites are the fields pinned to
-	// the log lines.
-	log *logs.Entry
+	// the log lines, kept per app (logKind) besides the old global ones.
+	log     *logs.Entry
+	logKind string
 }
 
 // fieldsChangedMsg asks the app to save the field preferences.
@@ -40,7 +41,7 @@ type fieldsChangedMsg struct{}
 // kind is the key of the shown object's field preferences.
 func (d *detailView) kind() string {
 	if d.log != nil {
-		return logFieldsKind
+		return d.logKind
 	}
 	return d.obj.GroupVersionKind().GroupKind().String()
 }
@@ -51,9 +52,12 @@ func (d *detailView) arrange() {
 		return
 	}
 	kind := d.kind()
+	is := func(f func(kind, pattern string) bool, n *yamltree.Node) bool {
+		return f(kind, n.Pattern()) || d.log != nil && f(logFieldsKind, n.Pattern())
+	}
 	d.root.Arrange(
-		func(n *yamltree.Node) bool { return d.fields.IsFavorite(kind, n.Pattern()) },
-		func(n *yamltree.Node) bool { return d.fields.IsHidden(kind, n.Pattern()) },
+		func(n *yamltree.Node) bool { return is(d.fields.IsFavorite, n) },
+		func(n *yamltree.Node) bool { return is(d.fields.IsHidden, n) },
 	)
 }
 
@@ -62,6 +66,9 @@ func (d *detailView) toggleFavorite(n *yamltree.Node) tea.Cmd {
 		return nil
 	}
 	d.fields.SetFavorite(d.kind(), n.Pattern(), !n.Favorite)
+	if d.log != nil && n.Favorite {
+		d.fields.SetFavorite(logFieldsKind, n.Pattern(), false)
+	}
 	return d.rearranged(n)
 }
 
@@ -70,6 +77,9 @@ func (d *detailView) toggleHidden(n *yamltree.Node) tea.Cmd {
 		return nil
 	}
 	d.fields.SetHidden(d.kind(), n.Pattern(), !n.IsHidden)
+	if d.log != nil && n.IsHidden {
+		d.fields.SetHidden(logFieldsKind, n.Pattern(), false)
+	}
 	return d.rearranged(n)
 }
 

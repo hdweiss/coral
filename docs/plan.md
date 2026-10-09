@@ -18,11 +18,8 @@ Done (see status.md): `Provider.Kubectl`/`RESTConfig` (no typed client yet; add 
 
 What people reach for k9s for most of the time.
 
-- **Logs.** Done (see status.md): `L` on a pod, ECS/JSON parsing, entry tree, fields pinned to lines, follow, filter, containers, previous. Still open:
-  - Tail length and since-time options, wrap and timestamp toggles, search with highlighting (jump between matches rather than filter), save to a file.
-  - Logs of a whole deployment / label selector, prefixed by pod; logs from a deployment row (pick the pod).
-  - logfmt parsing (`key=value` lines) into fields, so they can be pinned like JSON.
-  - Per-app pinned fields (today global), and a way to pin from the line view.
+- **Logs.** Done (see status.md): `L` on a pod or workload (pods merged and labelled), all containers merged, ECS/JSON/logfmt parsing, entry tree, per-app fields pinned to lines (also from the line view), follow, filter, search, wrap, time toggle, 0–6 ranges, save, containers, previous. Still open:
+  - A workload's log view follows its pod set (pods replaced by a rollout); today it is fixed when opened.
 - **Shell / attach (`s` / `a` on pods).** Run `kubectl exec -it` (and `kubectl attach`) through `tea.ExecProcess`, the same way `$EDITOR` runs. This is what k9s does and avoids SPDY handling in-process. Pick the container first, try `bash` then `sh`. Pass `--context` and `--kubeconfig`. Demo: run `$SHELL` with a banner saying it is fake.
   - `a` is free (add field moved to `ctrl+n`). `s` is still table sort, so shell needs `s` freed (sort to shift+letter like k9s) or another key.
 - **Delete and kill (`ctrl+d` / `ctrl+k`).** Confirm dialog with the object name; options for cascade (background/foreground/orphan) and grace period. Kill is delete with grace period 0. The table keeps its cursor on the next row. Demo: the fake tracker already supports delete; also re-create pods owned by a ReplicaSet so it feels real.

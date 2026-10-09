@@ -289,3 +289,27 @@ func TestLogSave(t *testing.T) {
 		t.Errorf("%s: %q", name, b)
 	}
 }
+
+func TestLogPinsPerApp(t *testing.T) {
+	fields := &config.Fields{Kinds: map[string]*config.KindFields{logFieldsKind: {Favorites: []string{".old"}}}}
+	pod := func(app string) *unstructured.Unstructured {
+		return &unstructured.Unstructured{Object: map[string]any{"metadata": map[string]any{"name": "p", "labels": map[string]any{"app": app}}}}
+	}
+	cart, web := newLogView("c", pod("cart"), fields), newLogView("c", pod("web"), fields)
+	cart.togglePin(".user")
+	if !slices.Equal(cart.pins(), []string{".old", ".user"}) || !slices.Equal(web.pins(), []string{".old"}) {
+		t.Errorf("cart %v, web %v", cart.pins(), web.pins())
+	}
+	web.togglePin(".old") // unpinning a global pin removes it everywhere
+	if !slices.Equal(cart.pins(), []string{".user"}) {
+		t.Errorf("after unpinning .old: %v", cart.pins())
+	}
+	nodes := leafPatterns(map[string]any{"a": map[string]any{"b": "x"}, "c": int64(1)})
+	var got []string
+	for _, n := range nodes {
+		got = append(got, n.Pattern())
+	}
+	if !slices.Equal(got, []string{".a.b", ".c"}) {
+		t.Errorf("leaves %v", got)
+	}
+}

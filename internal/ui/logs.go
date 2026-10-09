@@ -24,10 +24,24 @@ import (
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 )
 
-// logFieldsKind is the key of the log field preferences in config.Fields.
-// Favorites there are the fields pinned to every log line; they are global,
-// not per app.
+// logFieldsKind is the key of the log field preferences in config.Fields:
+// the favorites there are pinned to the lines of every log. Pins made since
+// are per app, under logFieldsKind + " " + app (fieldsKind); a log shows
+// both.
 const logFieldsKind = "(logs)"
+
+// fieldsKind is the key of this log's app's field preferences. The app is
+// the subject's app label, else its name.
+func (v *logView) fieldsKind() string {
+	app := v.subject.GetName()
+	for _, l := range []string{"app.kubernetes.io/name", "app", "k8s-app"} {
+		if a := v.subject.GetLabels()[l]; a != "" {
+			app = a
+			break
+		}
+	}
+	return logFieldsKind + " " + app
+}
 
 const (
 	logTail      = 500      // lines fetched when a log opens
@@ -648,12 +662,34 @@ func (v *logView) View() string {
 	return frame(v.title(), strings.Join(footer, "  "), lines, v.rect.w, v.rect.h, v.focused)
 }
 
-// pins returns the patterns of the fields pinned to log lines.
+// pins returns the patterns of the fields pinned to log lines: those of
+// every log, then this app's.
 func (v *logView) pins() []string {
-	if v.fields == nil || v.fields.Kinds[logFieldsKind] == nil {
+	if v.fields == nil {
 		return nil
 	}
-	return v.fields.Kinds[logFieldsKind].Favorites
+	var out []string
+	for _, kind := range []string{logFieldsKind, v.fieldsKind()} {
+		if k := v.fields.Kinds[kind]; k != nil {
+			for _, p := range k.Favorites {
+				if !slices.Contains(out, p) {
+					out = append(out, p)
+				}
+			}
+		}
+	}
+	return out
+}
+
+// togglePin pins a field to this app's lines, or unpins it wherever it is
+// pinned.
+func (v *logView) togglePin(pattern string) {
+	if v.fields.IsFavorite(logFieldsKind, pattern) {
+		v.fields.SetFavorite(logFieldsKind, pattern, false)
+		return
+	}
+	kind := v.fieldsKind()
+	v.fields.SetFavorite(kind, pattern, !v.fields.IsFavorite(kind, pattern))
 }
 
 // Keys too generic to stand alone as a label.
@@ -888,4 +924,16 @@ func (v *logView) save(now time.Time) (string, error) {
 		b.WriteString(e.Raw + "\n")
 	}
 	return name, os.WriteFile(name, []byte(b.String()), 0o644)
+}
+
+// leafPatterns lists the scalar fields of an entry, in tree order, for
+// pinning from the line view.
+func leafPatterns(fields map[string]any) []*yamltree.Node {
+	var out []*yamltree.Node
+	yamltree.Build(fields).Walk(func(n *yamltree.Node) {
+		if !n.HasChildren() && n.Arrangeable() && n.Parent != nil {
+			out = append(out, n)
+		}
+	})
+	return out
 }

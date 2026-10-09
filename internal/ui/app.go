@@ -13,8 +13,10 @@ import (
 	"github.com/charmbracelet/x/ansi"
 	"github.com/hdweiss/coral/internal/config"
 	"github.com/hdweiss/coral/internal/k8s"
+	"github.com/hdweiss/coral/internal/logs"
 	"github.com/hdweiss/coral/internal/schema"
 	"github.com/hdweiss/coral/internal/theme"
+	"github.com/hdweiss/coral/internal/yamltree"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/util/duration"
 )
@@ -411,6 +413,7 @@ func (a *App) syncDetail() {
 		return
 	}
 	if a.logs != nil {
+		a.detail.logKind = a.logs.fieldsKind()
 		a.detail.SetLog(a.logs.Selected())
 		return
 	}
@@ -1154,6 +1157,8 @@ func (a *App) logKey(msg tea.KeyPressMsg) tea.Cmd {
 		a.zoom = !a.zoom
 		a.layout()
 		return nil
+	case "ctrl+p":
+		return a.openPinMenu()
 	case "w":
 		a.logs.wrap = !a.logs.wrap
 		a.logs.scroll()
@@ -1916,7 +1921,7 @@ func helpView(w, h int) string {
 			{"L", "show the selected pod's log (again or esc to close)"},
 			{"p", "previous container's log (on a pod, or toggle in the log)"},
 			{"enter", "show the selected line as a tree (JSON / ECS fields)"},
-			{"ctrl+p", "in the entry: pin the field to every log line"},
+			{"ctrl+p", "pin a field of the selected line to this app's lines (in the entry view: the selected field)"},
 			{"s G", "toggle autoscroll / jump to the end and follow"},
 			{"f", "fullscreen"},
 			{"c", "all containers → each container"},
@@ -1978,4 +1983,35 @@ func helpView(w, h int) string {
 type helpSection struct {
 	title string
 	keys  [][2]string
+}
+
+// openPinMenu lists the fields of the selected log line to pin to (or
+// unpin from) this app's lines.
+func (a *App) openPinMenu() tea.Cmd {
+	e := a.logs.Selected()
+	if e == nil || e.Format == logs.Plain {
+		a.setFlash("pin: select a JSON or logfmt line", true)
+		return nil
+	}
+	pinned := a.logs.pins()
+	var items []paletteItem
+	for _, n := range leafPatterns(e.Fields) {
+		p := n.Pattern()
+		desc := firstLine(logs.Compact(n.Value))
+		if slices.Contains(pinned, p) {
+			desc = "★ " + desc
+		}
+		items = append(items, paletteItem{cmd: yamltree.PatternLabel(p), desc: desc, run: func() tea.Cmd {
+			a.logs.togglePin(p)
+			if a.detail.root != nil && a.detail.log != nil {
+				a.detail.arrange()
+				a.detail.relayout()
+			}
+			return emit(fieldsChangedMsg{})
+		}})
+	}
+	a.palette = newPalette(items, "")
+	a.palette.title = "Pin to " + strings.TrimPrefix(a.logs.fieldsKind(), logFieldsKind+" ") + " lines"
+	a.palette.input.Placeholder = "field"
+	return a.palette.input.Focus()
 }
