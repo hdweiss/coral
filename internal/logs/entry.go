@@ -25,6 +25,7 @@ const (
 	Plain Format = iota
 	JSON
 	ECS
+	Logfmt
 )
 
 func (f Format) String() string {
@@ -33,6 +34,8 @@ func (f Format) String() string {
 		return "json"
 	case ECS:
 		return "ecs"
+	case Logfmt:
+		return "logfmt"
 	}
 	return "text"
 }
@@ -77,6 +80,18 @@ func Parse(line string) Entry {
 			e.Format = ECS
 			obj = expandDots(obj)
 		}
+		e.Fields = obj
+		if t, ok := findTime(obj); ok {
+			e.Time = t
+		}
+		e.Level = findLevel(obj)
+		e.Message = findMessage(obj)
+		return e
+	}
+
+	if obj := parseLogfmt(line); obj != nil {
+		e.Raw = Clean(line)
+		e.Format = Logfmt
 		e.Fields = obj
 		if t, ok := findTime(obj); ok {
 			e.Time = t

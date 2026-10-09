@@ -47,11 +47,10 @@ func TestParseZapJSON(t *testing.T) {
 
 func TestParsePlain(t *testing.T) {
 	for line, want := range map[string]string{
-		`E1003 12:00:00.000000       1 server.go:1] failed`:         "ERROR",
-		`2026/10/03 12:00:00 [warn] 7#7: upstream timed out`:        "WARN",
-		`logger=context t=2026-10-03T12:00:00Z level=info msg="ok"`: "INFO",
-		`10.0.0.1 - - "GET / HTTP/1.1" 200`:                         "",
-		`{not json`:                                                 "",
+		`E1003 12:00:00.000000       1 server.go:1] failed`:  "ERROR",
+		`2026/10/03 12:00:00 [warn] 7#7: upstream timed out`: "WARN",
+		`10.0.0.1 - - "GET / HTTP/1.1" 200`:                  "",
+		`{not json`:                                          "",
 	} {
 		e := Parse(line)
 		if e.Format != Plain || e.Level != want || e.Message != line {
@@ -133,5 +132,29 @@ func TestReadLine(t *testing.T) {
 	want := []string{"a", long[:100], "", "last"}
 	if strings.Join(got, "|") != strings.Join(want, "|") {
 		t.Errorf("lines = %q", got)
+	}
+}
+
+func TestParseLogfmt(t *testing.T) {
+	e := Parse(`2026-10-09T10:00:00Z logger=http.server t=2026-10-09T09:59:59.5Z level=warn msg="Request Completed" status=200 path="/api/a b" cached`)
+	if e.Format != Logfmt || e.Level != "WARN" || e.Message != "Request Completed" {
+		t.Fatalf("got %v %q %q", e.Format, e.Level, e.Message)
+	}
+	if e.Fields["status"] != "200" || e.Fields["path"] != "/api/a b" || e.Fields["cached"] != "true" {
+		t.Errorf("fields %v", e.Fields)
+	}
+	if want := time.Date(2026, 10, 9, 9, 59, 59, 5e8, time.UTC); !e.Time.Equal(want) {
+		t.Errorf("time %v", e.Time)
+	}
+	for _, plain := range []string{
+		"Starting server on port=8080",           // prose with a pair
+		"user=bob logged in from the office now", // mostly prose
+		"a=1",                                    // one pair
+		`msg="unterminated value=1`,
+		"[INFO] x=1 y=2",
+	} {
+		if e := Parse(plain); e.Format != Plain {
+			t.Errorf("%q parsed as %v", plain, e.Format)
+		}
 	}
 }
