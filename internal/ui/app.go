@@ -692,6 +692,8 @@ func (a *App) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		a.setFocus(msg.f)
 	case editReadyMsg:
 		cmd = a.onEditReady(msg)
+	case execDoneMsg:
+		cmd = a.onExecDone(msg)
 	case editorExitMsg:
 		cmd = a.onEditorExit(msg)
 	case updatedMsg:
@@ -1691,14 +1693,13 @@ func (a *App) renderStatus() string {
 		}
 		obj := a.table.Selected()
 		for _, act := range a.actionsFor(a.table.res) {
-			if act.key == "p" {
-				continue // L is enough for the status bar
+			if act.key == "p" || act.key == "a" {
+				continue // L and s are enough for the status bar
 			}
 			act := act
 			hints = append(hints, hint{keyLabel(act.key), act.label, func() tea.Cmd { return a.runAction(act, obj) }})
 		}
-		hints = append(hints, hint{".", "actions", a.openActionMenu},
-			hint{"s", "sort", press(a.table.Update, plainKey('s'))})
+		hints = append(hints, hint{".", "actions", a.openActionMenu})
 	case focusDetail:
 		if a.logs != nil {
 			hints = append(hints, hint{"^p", "pin to lines", press(a.detail.Update, ctrlKey('p'))},
@@ -1771,7 +1772,7 @@ func helpView(w, h int) string {
 			{"← → h l", "collapse / expand, or move between panels"},
 			{"enter space", "open / toggle; on a resource in the navigator, open its list (also l or a click)"},
 			{"y", "table: go to the YAML details"},
-			{"s S", "table: next sort column / reverse"},
+			{"shift+letter", "table: sort by the column with that letter underlined (again to reverse; k9s: N name, A age, S status…)"},
 			{"o", "CRDs list: open the selected CRD's instances (also double-click)"},
 			{"e", "edit the object in $EDITOR (at the selected field)"},
 			{"ctrl+n", "add a field below the selected one, from the API schema"},

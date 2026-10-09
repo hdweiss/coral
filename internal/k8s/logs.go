@@ -87,3 +87,17 @@ func LogContainers(pod *unstructured.Unstructured) []string {
 	}
 	return out
 }
+
+// ContainerRunning reports whether a container of the pod is running.
+func ContainerRunning(pod *unstructured.Unstructured, name string) bool {
+	for _, field := range []string{"containerStatuses", "initContainerStatuses", "ephemeralContainerStatuses"} {
+		list, _, _ := unstructured.NestedSlice(pod.Object, "status", field)
+		for _, c := range list {
+			if m, ok := c.(map[string]any); ok && m["name"] == name {
+				s, _ := m["state"].(map[string]any)
+				return s["running"] != nil
+			}
+		}
+	}
+	return false
+}

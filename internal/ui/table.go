@@ -7,6 +7,7 @@ import (
 	"strings"
 
 	tea "charm.land/bubbletea/v2"
+	"charm.land/lipgloss/v2"
 	"github.com/charmbracelet/x/ansi"
 	"github.com/hdweiss/coral/internal/k8s"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
@@ -188,16 +189,12 @@ func (t *tableView) height() int { return t.rect.h - 3 } // border + header
 func (t *tableView) Update(msg tea.Msg) tea.Cmd {
 	switch msg := msg.(type) {
 	case tea.KeyPressMsg:
-		switch msg.String() {
-		case "s":
-			t.sortCol, t.sortDesc = t.nextVisibleCol(t.sortCol), false
-			t.rebuild()
-		case "S":
-			t.sortBy(t.sortCol)
-		default:
-			if c, ok := moveCursor(msg.String(), t.cursor, len(t.rows), t.height()); ok {
-				t.cursor = c
-			}
+		if col, ok := sortKeys(t.cols)[msg.String()]; ok {
+			t.sortBy(col)
+			break
+		}
+		if c, ok := moveCursor(msg.String(), t.cursor, len(t.rows), t.height()); ok {
+			t.cursor = c
 		}
 	case clickMsg:
 		if msg.y == 0 {
@@ -237,16 +234,53 @@ func (t *tableView) Update(msg tea.Msg) tea.Cmd {
 	return nil
 }
 
-// nextVisibleCol returns the column after c, skipping hidden columns.
-func (t *tableView) nextVisibleCol(c int) int {
-	n := max(len(t.cols), 1)
-	for range n {
-		c = (c + 1) % n
-		if c >= len(t.widths) || t.widths[c] > 0 {
-			return c
+// k9sSortKeys are k9s's shift+letter sort keys for its common columns.
+var k9sSortKeys = map[string]string{
+	"NAME": "N", "AGE": "A", "NAMESPACE": "P", "STATUS": "S", "RESTARTS": "T",
+	"IP": "I", "NODE": "O", "CPU": "C", "MEM": "M",
+}
+
+// Shift letters that are taken in the table (live mode, logs, events, end),
+// so no column sorts with them. k9s sorts READY with R, which is live mode
+// here.
+var reservedSortKeys = "RLEG"
+
+// sortKeys maps a shift+letter key ("N") to the column it sorts by: k9s's
+// letter for its columns, else the first free letter of the column name.
+// The same key again reverses the order.
+func sortKeys(cols []k8s.Column) map[string]int {
+	keys := map[string]int{}
+	free := func(k string) bool {
+		_, taken := keys[k]
+		return k != "" && !taken && !strings.Contains(reservedSortKeys, k)
+	}
+	for i, c := range cols {
+		if k := k9sSortKeys[c.Name]; free(k) {
+			keys[k] = i
 		}
 	}
-	return c
+	for i, c := range cols {
+		if _, ok := k9sSortKeys[c.Name]; ok {
+			continue
+		}
+		for _, r := range strings.ToUpper(c.Name) {
+			if k := string(r); r >= 'A' && r <= 'Z' && free(k) {
+				keys[k] = i
+				break
+			}
+		}
+	}
+	return keys
+}
+
+// sortKeyOf returns the key that sorts by column i, or "".
+func sortKeyOf(cols []k8s.Column, i int) string {
+	for k, c := range sortKeys(cols) {
+		if c == i {
+			return k
+		}
+	}
+	return ""
 }
 
 type (
@@ -436,17 +470,24 @@ func (t *tableView) renderHeader(widths []int) string {
 		t.colX = append(t.colX, x)
 		t.colIdx = append(t.colIdx, i)
 		x += widths[i] + colGap
+		st, name := stHeader, c.Name
 		if i == t.sortCol {
-			arrow := "↑"
-			if t.sortDesc {
-				arrow = "↓"
-			}
-			cells = append(cells, stAccent.Bold(true).Render(fit(c.Name+arrow, widths[i])))
-		} else {
-			cells = append(cells, stHeader.Render(fit(c.Name, widths[i])))
+			st = stAccent.Bold(true)
+			name += map[bool]string{false: "↑", true: "↓"}[t.sortDesc]
 		}
+		cells = append(cells, underlineKey(fit(name, widths[i]), sortKeyOf(t.cols, i), st))
 	}
 	return joinCells(cells)
+}
+
+// underlineKey renders s in st with the first occurrence of the shift+letter
+// key k underlined, like a menu accelerator.
+func underlineKey(s, k string, st lipgloss.Style) string {
+	i := strings.Index(s, k)
+	if k == "" || i < 0 {
+		return st.Render(s)
+	}
+	return st.Render(s[:i]) + st.Underline(true).Render(s[i:i+1]) + st.Render(s[i+1:])
 }
 
 // joinCells lays out rendered cells with the leading space and column gaps.
