@@ -59,6 +59,10 @@ func objectActions() []action {
 			}},
 		{key: "ctrl+n", label: "add", desc: "add a field from the API schema", write: true,
 			run: func(a *App, _ *unstructured.Unstructured) tea.Cmd { return a.startAdd() }},
+		{key: "ctrl+d", label: "delete", desc: "delete, after asking (propagation, grace period)", write: true,
+			run: func(a *App, obj *unstructured.Unstructured) tea.Cmd { return a.confirmDelete(obj, false) }},
+		{key: "ctrl+k", label: "kill", desc: "delete the pod without a grace period, after asking", write: true, on: kinds("pods"),
+			run: func(a *App, obj *unstructured.Unstructured) tea.Cmd { return a.confirmDelete(obj, true) }},
 	}
 }
 

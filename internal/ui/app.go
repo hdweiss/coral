@@ -692,6 +692,8 @@ func (a *App) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		a.setFocus(msg.f)
 	case editReadyMsg:
 		cmd = a.onEditReady(msg)
+	case deletedMsg:
+		cmd = a.onDeleted(msg)
 	case execDoneMsg:
 		cmd = a.onExecDone(msg)
 	case editorExitMsg:
@@ -1693,8 +1695,8 @@ func (a *App) renderStatus() string {
 		}
 		obj := a.table.Selected()
 		for _, act := range a.actionsFor(a.table.res) {
-			if act.key == "p" || act.key == "a" {
-				continue // L and s are enough for the status bar
+			if act.key == "p" || act.key == "a" || act.key == "ctrl+k" || act.key == "ctrl+n" {
+				continue // in the menu; the status bar has no room
 			}
 			act := act
 			hints = append(hints, hint{keyLabel(act.key), act.label, func() tea.Cmd { return a.runAction(act, obj) }})

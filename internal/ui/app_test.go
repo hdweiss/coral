@@ -201,3 +201,30 @@ func TestConfirm(t *testing.T) {
 		t.Error("y didn't confirm")
 	}
 }
+
+func TestDeleteAsksFirst(t *testing.T) {
+	a := newTestApp(t, Options{})
+	showPods(t, a)
+	victim := a.table.Selected()
+	a.Update(tea.KeyPressMsg{Code: 'd', Mod: tea.ModCtrl})
+	if a.confirm == nil {
+		t.Fatal("ctrl+d didn't ask")
+	}
+	a.Update(tea.KeyPressMsg{Code: tea.KeyEnter}) // focus is on Cancel
+	if a.confirm != nil {
+		t.Fatal("enter didn't close the dialog")
+	}
+	if _, err := a.store.GetObject(a.cur, victim.GetNamespace(), victim.GetName()); err != nil {
+		t.Fatal("enter deleted the pod")
+	}
+	a.Update(tea.KeyPressMsg{Code: 'd', Mod: tea.ModCtrl})
+	_, cmd := a.Update(tea.KeyPressMsg{Code: 'y', Text: "y"})
+	msg := cmd().(deletedMsg)
+	if msg.err != nil {
+		t.Fatal(msg.err)
+	}
+	a.Update(msg)
+	if _, err := a.store.GetObject(a.cur, victim.GetNamespace(), victim.GetName()); err == nil {
+		t.Error("the pod is still there")
+	}
+}

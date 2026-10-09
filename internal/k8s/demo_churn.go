@@ -9,6 +9,7 @@ import (
 
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
+	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
 	dynamicfake "k8s.io/client-go/dynamic/fake"
 	k8stesting "k8s.io/client-go/testing"
@@ -51,7 +52,7 @@ var podsGVR = MustLookup("pods").GVR()
 
 func (c *churner) step(round int) {
 	if c.starting != "" {
-		c.update(c.starting, func(p *unstructured.Unstructured) { setPodState(p, running, 0) })
+		c.update(churnNS, c.starting, func(p *unstructured.Unstructured) { setPodState(p, running, 0) })
 		c.starting = ""
 	}
 	if round%2 == 0 {
@@ -72,15 +73,15 @@ func (c *churner) pods() []unstructured.Unstructured {
 
 // update changes a pod and bumps its resourceVersion, so that an edit
 // started before is a conflict.
-func (c *churner) update(name string, change func(*unstructured.Unstructured)) {
-	o, err := c.tracker.Get(podsGVR, churnNS, name)
+func (c *churner) update(ns, name string, change func(*unstructured.Unstructured)) {
+	o, err := c.tracker.Get(podsGVR, ns, name)
 	if err != nil {
 		return
 	}
 	p := o.(*unstructured.Unstructured).DeepCopy()
 	change(p)
 	bumpVersion(p)
-	c.tracker.Update(podsGVR, p, churnNS)
+	c.tracker.Update(podsGVR, p, ns)
 }
 
 func bumpVersion(u *unstructured.Unstructured) {
@@ -101,7 +102,7 @@ func (c *churner) crashLoop(restarted bool) {
 	if pod == nil {
 		return
 	}
-	c.update(pod.GetName(), func(p *unstructured.Unstructured) {
+	c.update(churnNS, pod.GetName(), func(p *unstructured.Unstructured) {
 		restarts := podRestarts(p)
 		if restarted {
 			setPodState(p, "Restarted", restarts+1)
@@ -201,4 +202,45 @@ func setPodState(p *unstructured.Unstructured, st podState, restarts int64) {
 		}
 	}
 	unstructured.SetNestedSlice(p.Object, conds, "status", "conditions")
+}
+
+// replacePods plays the controllers of the demo: a deleted pod owned by a
+// ReplicaSet, StatefulSet or DaemonSet comes back as a new pod (a
+// StatefulSet's under the same name) that starts up a few seconds later.
+func replacePods(tracker k8stesting.ObjectTracker) k8stesting.ReactionFunc {
+	return func(action k8stesting.Action) (bool, runtime.Object, error) {
+		del, ok := action.(k8stesting.DeleteAction)
+		if !ok {
+			return false, nil, nil
+		}
+		o, err := tracker.Get(podsGVR, del.GetNamespace(), del.GetName())
+		if err != nil {
+			return false, nil, nil
+		}
+		old := o.(*unstructured.Unstructured).DeepCopy()
+		owners := old.GetOwnerReferences()
+		if len(owners) == 0 || !slices.Contains([]string{"ReplicaSet", "StatefulSet", "DaemonSet"}, owners[0].Kind) {
+			return false, nil, nil
+		}
+		go func() {
+			time.Sleep(time.Second)
+			p := old.DeepCopy()
+			now := time.Now()
+			if owners[0].Kind != "StatefulSet" {
+				p.SetName(owners[0].Name + "-" + hash(now.String(), 5))
+			}
+			p.SetUID(types.UID(fmt.Sprintf("replaced-%d", now.UnixNano())))
+			p.SetCreationTimestamp(metav1.NewTime(now.Truncate(time.Second)))
+			p.SetResourceVersion("1")
+			p.SetDeletionTimestamp(nil)
+			setPodState(p, "ContainerCreating", 0)
+			if tracker.Create(podsGVR, p, p.GetNamespace()) != nil {
+				return
+			}
+			time.Sleep(3 * time.Second)
+			c := &churner{tracker: tracker}
+			c.update(p.GetNamespace(), p.GetName(), func(p *unstructured.Unstructured) { setPodState(p, running, 0) })
+		}()
+		return false, nil, nil
+	}
 }

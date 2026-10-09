@@ -224,3 +224,19 @@ func (s *Store) replace(k Key, obj *unstructured.Unstructured) {
 		}
 	}
 }
+
+// Delete deletes obj, an object of k's resource. The uid precondition makes
+// sure it is still the object that was shown, not a new one of that name.
+// Cached lists keep it: a real cluster may only mark it Terminating, and the
+// next list (or a watch) shows what happened.
+func (s *Store) Delete(k Key, obj *unstructured.Unstructured, opts metav1.DeleteOptions) error {
+	ri, err := s.resource(k, obj.GetNamespace())
+	if err != nil {
+		return err
+	}
+	uid := obj.GetUID()
+	opts.Preconditions = &metav1.Preconditions{UID: &uid}
+	ctx, cancel := context.WithTimeout(context.Background(), s.timeout)
+	defer cancel()
+	return ri.Delete(ctx, obj.GetName(), opts)
+}
