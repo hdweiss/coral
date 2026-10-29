@@ -68,15 +68,18 @@ func rootCmd() *cobra.Command {
 			} else if p, err = k8s.NewKubeProvider(k8s.KubeOptions{Kubeconfig: kubeconfig, Trace: trace, CacheDir: cacheDir}); err != nil {
 				return err
 			}
+			if opts.Settings, err = config.LoadSettings(config.SettingsPath()); err != nil {
+				return fmt.Errorf("%s: %w", config.SettingsPath(), err)
+			}
+			if themeSpec == "" {
+				themeSpec = opts.Settings.Theme
+			}
 			if opts.Theme, err = theme.Resolve(themeSpec); err != nil {
 				return err
 			}
 			opts.Version = version
 			opts.PinsPath = config.PinsPath(demo)
 			opts.FieldsPath = config.FieldsPath()
-			if opts.Settings, err = config.LoadSettings(config.SettingsPath()); err != nil {
-				return fmt.Errorf("%s: %w", config.SettingsPath(), err)
-			}
 			store := k8s.NewStore(p, timeout)
 			if !demo {
 				store.SetCacheDir(cacheDir)
@@ -99,8 +102,8 @@ func rootCmd() *cobra.Command {
 	f.BoolVar(&demo, "demo", false, "use a built-in fake cluster")
 	f.BoolVar(&opts.ReadOnly, "readonly", false, "refuse every change (also per context: readonly patterns in config.yaml)")
 	f.StringVar(&traceAPI, "trace-api", "", "append every API request to this file (time, verb, path, status, bytes, duration)")
-	f.StringVar(&themeSpec, "theme", envOr("CORALCTL_THEME", "auto"),
-		`colors: "auto" (Omarchy's when installed, else coral), "omarchy", a built-in theme (`+strings.Join(theme.Names(), ", ")+`), or a path to an Omarchy colors.toml or theme directory ($CORALCTL_THEME)`)
+	f.StringVar(&themeSpec, "theme", os.Getenv("CORALCTL_THEME"),
+		`colors: "auto" (Omarchy's when installed, else coral), "omarchy", a built-in theme (`+strings.Join(theme.Names(), ", ")+`), or a path to an Omarchy colors.toml or theme directory ($CORALCTL_THEME, else theme in config.yaml, else auto)`)
 
 	cmd.AddCommand(&cobra.Command{
 		Use:   "version",
@@ -108,13 +111,6 @@ func rootCmd() *cobra.Command {
 		Run:   func(cmd *cobra.Command, args []string) { fmt.Println("coral", version) },
 	})
 	return cmd
-}
-
-func envOr(key, def string) string {
-	if v := os.Getenv(key); v != "" {
-		return v
-	}
-	return def
 }
 
 // silenceKlog stops client-go from logging over the TUI.

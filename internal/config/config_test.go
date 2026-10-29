@@ -53,10 +53,13 @@ func TestSettings(t *testing.T) {
 	if s, err := LoadSettings(p); err != nil || len(s.ReadOnly) != 0 {
 		t.Fatalf("missing file: %+v %v", s, err)
 	}
-	os.WriteFile(p, []byte("readonly:\n  - \"*prod*\"\n  - staging\n"), 0o600)
+	os.WriteFile(p, []byte("theme: kanagawa\nreadonly:\n  - \"*prod*\"\n  - staging\n"), 0o600)
 	s, err := LoadSettings(p)
 	if err != nil {
 		t.Fatal(err)
+	}
+	if s.Theme != "kanagawa" {
+		t.Errorf("theme = %q", s.Theme)
 	}
 	for ctx, want := range map[string]bool{"eu-prod-1": true, "staging": true, "staging-2": false, "dev": false} {
 		if s.IsReadOnly(ctx) != want {

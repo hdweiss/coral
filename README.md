@@ -40,7 +40,7 @@ coral -A                    # all namespaces
 coral --demo                # fake clusters
 ```
 
-Other flags: `--kubeconfig`, `--refresh`, `--timeout`, `--readonly`, `--theme` (or `$CORALCTL_THEME`) and `--trace-api <file>` (log every API request). Run `coral --help` for details, and press `?` in the app for key bindings.
+Other flags: `--kubeconfig`, `--refresh`, `--timeout`, `--readonly`, `--theme` (or `$CORALCTL_THEME`, or `theme` in `config.yaml`) and `--trace-api <file>` (log every API request). Run `coral --help` for details, and press `?` in the app for key bindings.
 
 Settings live in `config.yaml` in coral's config directory (`~/.config/coral/` on Linux):
 
@@ -48,6 +48,9 @@ Settings live in `config.yaml` in coral's config directory (`~/.config/coral/` o
 # Contexts where coral refuses to change anything (shell globs).
 readonly:
   - "*prod*"
+# Colors, as for --theme: auto, omarchy, a built-in theme or a path to an
+# Omarchy colors.toml/theme directory. --theme and $CORALCTL_THEME win.
+theme: kanagawa
 ```
 
 ## Development

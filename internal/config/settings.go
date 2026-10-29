@@ -14,8 +14,11 @@ import (
 //	# Contexts where coral refuses to change anything (shell globs).
 //	readonly:
 //	  - "*prod*"
+//	# Colors, as for --theme; the flag and $CORALCTL_THEME take precedence.
+//	theme: kanagawa
 type Settings struct {
 	ReadOnly []string `json:"readonly,omitempty"`
+	Theme    string   `json:"theme,omitempty"`
 }
 
 // SettingsPath returns where config.yaml lives.
